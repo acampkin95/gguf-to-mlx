@@ -97,21 +97,21 @@ KNOWN_CONVERSION_ISSUES: dict[str, dict] = {
         "issue": "head_count_kv metadata returns list instead of int",
         "workarounds": [
             ("cpmm model.gguf --no-quantize", "Converts to float16 only, avoids gguf2mlx quant step"),
-            ("pip install --upgrade gguf2mlx", "May already be fixed in latest version"),
+            ("python3 -m pip install --upgrade git+https://github.com/acampkin95/gguf2mlx.git", "May already be fixed in latest version"),
         ],
     },
     "gemma3": {
         "issue": "Similar metadata issues as Gemma4",
         "workarounds": [
             ("cpmm model.gguf --no-quantize", "Converts to float16 only"),
-            ("pip install --upgrade gguf2mlx", "May already be fixed"),
+            ("python3 -m pip install --upgrade git+https://github.com/acampkin95/gguf2mlx.git", "May already be fixed"),
         ],
     },
     "gemma2": {
         "issue": "May have similar head_count_kv issues",
         "workarounds": [
             ("cpmm model.gguf --no-quantize", "Converts to float16 only"),
-            ("pip install --upgrade gguf2mlx", "May already be fixed"),
+            ("python3 -m pip install --upgrade git+https://github.com/acampkin95/gguf2mlx.git", "May already be fixed"),
         ],
     },
 }
@@ -1063,7 +1063,7 @@ def preflight_checks(
     if not deps.get("gguf2mlx"):
         errors.append(
             "gguf2mlx not installed. "
-            "Install with: [cyan]pip install gguf2mlx[/cyan]"
+            "Install with: [cyan]python3 -m pip install git+https://github.com/acampkin95/gguf2mlx.git[/cyan]"
         )
     if not deps.get("mlx_lm") and not args.no_quantize:
         errors.append(
@@ -1154,7 +1154,7 @@ def ensure_deps(deps: dict, for_convert: bool = True):
     """Check required deps are installed, exit with helpful message if not."""
     missing = []
     if not deps.get("gguf2mlx"):
-        missing.append(("gguf2mlx", "pip install gguf2mlx"))
+        missing.append(("gguf2mlx", "python3 -m pip install git+https://github.com/acampkin95/gguf2mlx.git"))
     if for_convert and not deps.get("mlx_lm"):
         missing.append(("mlx-lm", "pip install mlx-lm"))
 
