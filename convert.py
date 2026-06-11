@@ -21,6 +21,8 @@ import subprocess
 import shutil
 import argparse
 from pathlib import Path
+from typing import Any, Optional
+from urllib.parse import urlparse
 
 # Rich - console output, progress, prompts
 from rich.console import Console
@@ -32,6 +34,7 @@ from rich.progress import (
     TextColumn,
     BarColumn,
     TaskProgressColumn,
+    TimeRemainingColumn,
 )
 from rich.prompt import Prompt, Confirm
 from rich.rule import Rule
@@ -42,16 +45,32 @@ from rich import box
 # Hardware detection
 import psutil
 
-# ═══════════════════════════════════════════════════════════════════════════
+# For registry downloads
+try:
+    import urllib.request
+    HAS_URLLIB = True
+except ImportError:
+    HAS_URLLIB = False
+
+
 # Module-level console - configured in main() based on --no-color
-# ═══════════════════════════════════════════════════════════════════════════
 
 console = Console(highlight=False)
 
+# Shared constants (SonarQube S1192 dedup)
+STATUS_READY = "[green]READY[/green]"
+STATUS_SKIPPED = "[yellow]SKIPPED[/yellow]"
+MSG_CANCELLED = "\n  Cancelled."
+_MOE_4BIT_LABEL = "MoE 4-bit"
+_CPMM_NO_QUANTIZE = "cpmm model.gguf --no-quantize"
+_UPGRADE_GGUF2MLX = "python3 -m pip install --upgrade git+https://github.com/acampkin95/gguf2mlx.git"
+_STYLE_BOLD_CYAN = "bold cyan"
+_STYLE_BOLD_MAGENTA = "bold magenta"
+_SEPARATOR = "═" * 77
 
-# ═══════════════════════════════════════════════════════════════════════════
+
+
 # GGUF Quantisation Type → Metadata Mapping
-# ═══════════════════════════════════════════════════════════════════════════
 
 # These are the gguf general.file_type enum values (GGML FTYPE)
 # See: llama.cpp gguf-py/gguf/constants.py
@@ -83,38 +102,65 @@ GGUF_FTYPE_MAP = {
     24: ("MOSTLY_IQ4_XS",        "4-bit",     "IQ 4-bit extra small"),
     25: ("MOSTLY_IQ1_M",         "1-bit",     "IQ 1-bit medium"),
     26: ("MOSTLY_BF16",          "bfloat16",  "brain float 16"),
-    27: ("MOSTLY_Q4_0_4_4",      "4-bit",     "MoE 4-bit"),
-    28: ("MOSTLY_Q4_0_4_8",      "4-bit",     "MoE 4-bit"),
-    29: ("MOSTLY_Q4_0_8_8",      "4-bit",     "MoE 4-bit"),
+    27: ("MOSTLY_Q4_0_4_4",      "4-bit",     _MOE_4BIT_LABEL),
+    28: ("MOSTLY_Q4_0_4_8",      "4-bit",     _MOE_4BIT_LABEL),
+    29: ("MOSTLY_Q4_0_8_8",      "4-bit",     _MOE_4BIT_LABEL),
     30: ("MOSTLY_TQ1_0",         "1-bit",     "ternary 1-bit"),
     31: ("MOSTLY_TQ2_0",         "2-bit",     "ternary 2-bit"),
 }
 
 
 # Architectures known to have gguf2mlx compatibility issues
-KNOWN_CONVERSION_ISSUES: dict[str, dict] = {
+KNOWN_CONVERSION_ISSUES: dict[str, dict[str, Any]] = {
     "gemma4": {
         "issue": "head_count_kv metadata returns list instead of int",
         "workarounds": [
-            ("cpmm model.gguf --no-quantize", "Converts to float16 only, avoids gguf2mlx quant step"),
-            ("python3 -m pip install --upgrade git+https://github.com/acampkin95/gguf2mlx.git", "May already be fixed in latest version"),
+            (_CPMM_NO_QUANTIZE, "Converts to float16 only, avoids gguf2mlx quant step"),
+            (_UPGRADE_GGUF2MLX, "May already be fixed in latest version"),
         ],
     },
     "gemma3": {
         "issue": "Similar metadata issues as Gemma4",
         "workarounds": [
-            ("cpmm model.gguf --no-quantize", "Converts to float16 only"),
-            ("python3 -m pip install --upgrade git+https://github.com/acampkin95/gguf2mlx.git", "May already be fixed"),
+            (_CPMM_NO_QUANTIZE, "Converts to float16 only"),
+            (_UPGRADE_GGUF2MLX, "May already be fixed"),
         ],
     },
     "gemma2": {
         "issue": "May have similar head_count_kv issues",
         "workarounds": [
-            ("cpmm model.gguf --no-quantize", "Converts to float16 only"),
-            ("python3 -m pip install --upgrade git+https://github.com/acampkin95/gguf2mlx.git", "May already be fixed"),
+            (_CPMM_NO_QUANTIZE, "Converts to float16 only"),
+            (_UPGRADE_GGUF2MLX, "May already be fixed"),
+        ],
+    },
+    "qwen35": {
+        "issue": "mlx_lm does not support Qwen3.5 architecture yet (Fast-Fail)",
+        "workarounds": [
+            ("Use Ollama: brew install ollama && ollama run qwen2.5", "Native Qwen support via Ollama"),
+            ("Use llama.cpp directly", "Run GGUF directly with llama-cli"),
+            ("Check mlx_lm for updates: https://github.com/ml-explore/mlx-examples", "Support may be added in future releases"),
+        ],
+    },
+    "deepseek_v3": {
+        "issue": "deepseek-v3 requires specific mlx-lm versions and may have quantization bugs",
+        "workarounds": [
+            ("python3 -m pip install --upgrade mlx-lm", "Ensure you are on the absolute latest version"),
+            (_CPMM_NO_QUANTIZE, "Convert to float16 to avoid quant bugs"),
         ],
     },
 }
+
+# Architectures supported by mlx_lm (as of latest release)
+# This list can be expanded as mlx_lm adds support
+SUPPORTED_MLX_ARCHITECTURES = frozenset([
+    "llama", "llama2", "llama3", "llama3_1", "llama3_2",
+    "gemma", "gemma2",
+    "mistral", "mixtral",
+    "phi", "phi2", "phi3", "phi3_5",
+    "qwen", "qwen2", "qwen2_5",
+    "deepseek", "deepseek2", "deepseek_v3",
+    "gptneox", "stablelm",
+])
 
 
 
@@ -135,33 +181,37 @@ GGUF_TO_MLX_TENSOR_RENAME = {
 }
 
 
-def fix_gemma4_tensor_names(intermediate_dir: Path) -> bool:
-    """Fix Gemma4 tensor names if they don't match MLX expected format.
+def fix_gemma4_tensor_names(intermediate_dir: Path) -> None:
+    """Detect and report Gemma4 tensor naming issues.
     
-    Returns True if fixes were applied, False otherwise.
+    Displays workaround guidance when issues are detected.
+    Auto-fix is not yet supported (safetensors are read-only).
     """
     try:
         from safetensors import safe_open
     except ImportError:
-        return False
+        return  # Can't import safetensors
     
     # Check if this is a Gemma4 model with wrong tensor names
     safetensor_files = list(intermediate_dir.glob("*.safetensors"))
     if not safetensor_files:
-        return False
+        return  # No safetensor files
     
     # Check first file for problematic tensor names
     needs_fix = False
-    with safe_open(safetensor_files[0], framework="numpy") as f:
-        keys = list(f.keys())
-        # Check for blk.* pattern (GGUF format) without model.layers
-        if any(k.startswith("blk.") for k in keys):
-            needs_fix = True
+    try:
+        with safe_open(safetensor_files[0], framework="numpy") as f:  # type: ignore[no-untyped-call]
+            keys = list(f.keys())
+            # Check for blk.* pattern (GGUF format) without model.layers
+            if any(k.startswith("blk.") for k in keys):
+                needs_fix = True
+    except Exception:
+        return  # Error reading safetensors
     
     if not needs_fix:
-        return False
+        return
     
-    print(f"  [yellow]⚠[/yellow]  Detected Gemma4 tensor naming issue, applying fix...")
+    console.print("  [yellow]⚠[/yellow]  Detected Gemma4 tensor naming issue, applying fix...")
     
     # We need to rename tensors, but safetensors are read-only in this context
     # Instead, we'll create a mapping and document the workaround
@@ -178,11 +228,11 @@ def fix_gemma4_tensor_names(intermediate_dir: Path) -> bool:
     console.print("  [dim]3.[/dim] Use Ollama or llama.cpp for 4-bit conversion")
     console.print()
     
-    return False  # Can't auto-fix without rewriting safetensors
+    # Can't auto-fix without rewriting safetensors - user must use workarounds
 
 
 
-def is_known_issue_arch(arch: str) -> tuple[bool, dict | None]:
+def is_known_issue_arch(arch: str) -> tuple[bool, dict[str, Any] | None]:
     """Check if architecture is known to have gguf2mlx issues."""
     arch_lower = arch.lower()
     for known_arch, issue_info in KNOWN_CONVERSION_ISSUES.items():
@@ -191,10 +241,32 @@ def is_known_issue_arch(arch: str) -> tuple[bool, dict | None]:
     return False, None
 
 
+def is_mlx_supported_arch(arch: str) -> tuple[bool, str | None]:
+    """Check if architecture is supported by mlx_lm.
+    
+    Returns (is_supported, reason) where reason is None if supported,
+    or a message explaining why it's not supported.
+    """
+    arch_lower = arch.lower()
+    
+    # Check if explicitly unsupported due to known issues
+    for known_issue_arch in KNOWN_CONVERSION_ISSUES.keys():
+        if arch_lower.startswith(known_issue_arch):
+            return False, f"Known incompatibility with {known_issue_arch} models"
+    
+    # Check against supported list
+    for supported_arch in SUPPORTED_MLX_ARCHITECTURES:
+        if arch_lower.startswith(supported_arch):
+            return True, None
+    
+    # Unknown architecture - may work but not guaranteed
+    return False, "Architecture not in mlx_lm supported list (may still work)"
 
-def read_gemma4_metadata(reader, arch: str) -> dict:
+
+
+def read_gemma4_metadata(reader: object, _arch: str) -> dict[str, Any]:
     """Read Gemma4-specific metadata fields."""
-    gemma_meta: dict = {}
+    gemma_meta: dict[str, Any] = {}
 
     # Try Gemma4-specific fields
     for field_name, possible_keys in Gemma4_METADATA_FIELDS.items():
@@ -207,7 +279,7 @@ def read_gemma4_metadata(reader, arch: str) -> dict:
     return gemma_meta
 
 
-def classify_source_quality(file_type: int) -> dict:
+def classify_source_quality(file_type: int) -> dict[str, str]:
     """Classify source GGUF model quality to inform re-quantization decisions."""
     if file_type <= 1:  # F32 or F16
         return {"risk": "none", "label": "unquantized source",
@@ -228,9 +300,8 @@ def classify_source_quality(file_type: int) -> dict:
             "advice": "Unable to determine source quality."}
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+
 # Quantisation Presets
-# ═══════════════════════════════════════════════════════════════════════════
 
 PRESETS = {
     "speed": {
@@ -256,11 +327,10 @@ PRESETS = {
 HIGH_BANDWIDTH_PRESET = "m5-max"
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Hardware Detection
-# ═══════════════════════════════════════════════════════════════════════════
 
-def detect_apple_silicon() -> dict:
+# Hardware Detection
+
+def detect_apple_silicon() -> dict[str, Any]:
     """Detect Apple Silicon hardware and return chip info.
 
     Returns a dict with:
@@ -324,16 +394,15 @@ def detect_apple_silicon() -> dict:
     return result
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+
 # Smart Defaults (Hardware-Aware)
-# ═══════════════════════════════════════════════════════════════════════════
 
 def smart_defaults(
     model_size_gb: float,
     chip_tier: str = "base",
     ram_gb: float = 0,
     chip_gen: int = 0,
-) -> dict:
+) -> dict[str, Any]:
     """Auto-select quantization params based on model size and hardware.
 
     Returns dict with bits, group_size, mode, description explaining why.
@@ -400,9 +469,8 @@ def smart_defaults(
         }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+
 # CLI
-# ═══════════════════════════════════════════════════════════════════════════
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -477,8 +545,16 @@ Examples:
 
     # Behaviour
     p.add_argument(
+        "--resume", action="store_true",
+        help="Resume conversion by skipping Step 1 if intermediate files exist",
+    )
+    p.add_argument(
         "--inspect", action="store_true",
         help="Display GGUF metadata and exit (no conversion)",
+    )
+    p.add_argument(
+        "--estimate", action="store_true",
+        help="Estimate conversion time, memory, and final size (no conversion)",
     )
     p.add_argument(
         "--mtp", action="store_true",
@@ -487,6 +563,10 @@ Examples:
     p.add_argument(
         "--keep-intermediate", action="store_true",
         help="Keep intermediate float16 files after quantisation",
+    )
+    p.add_argument(
+        "--cleanup-old", action="store_true",
+        help="Remove existing intermediate directories in the output parent folder",
     )
     p.add_argument(
         "--force", "-f", action="store_true",
@@ -504,9 +584,8 @@ Examples:
     return p
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+
 # GGUF Metadata Reader
-# ═══════════════════════════════════════════════════════════════════════════
 
 def _has_gguf_py() -> bool:
     try:
@@ -516,7 +595,7 @@ def _has_gguf_py() -> bool:
         return False
 
 
-def _field_value(reader, name: str):
+def _field_value(reader: Any, name: str) -> Any:
     """Safely read a scalar field value from a GGUF reader."""
     field = reader.get_field(name)
     if field is None:
@@ -529,20 +608,18 @@ def _field_value(reader, name: str):
         elif hasattr(val, "item"):
             val = val.item()
         # Handle list values (some GGUF fields return lists, e.g., Gemma4 head_count_kv)
-        if isinstance(val, list):
-            val = val[0] if len(val) > 0 else None
-        elif isinstance(val, tuple):
+        if isinstance(val, (list, tuple)):
             val = val[0] if len(val) > 0 else None
         return val
     except Exception:
         return None
 
 
-def _field_exists(reader, name: str) -> bool:
+def _field_exists(reader: Any, name: str) -> bool:
     return reader.get_field(name) is not None
 
 
-def read_gguf_metadata(gguf_path: Path) -> dict | None:
+def read_gguf_metadata(gguf_path: Path) -> dict[str, Any] | None:
     """Read key metadata from a GGUF file. Returns None if gguf-py unavailable."""
     if not _has_gguf_py():
         return None
@@ -551,7 +628,7 @@ def read_gguf_metadata(gguf_path: Path) -> dict | None:
 
     reader = GGUFReader(str(gguf_path))
 
-    meta: dict = {
+    meta: dict[str, Any] = {
         "architecture": None,
         "file_type": None,
         "file_type_name": None,
@@ -703,23 +780,22 @@ def read_gguf_metadata(gguf_path: Path) -> dict | None:
     return meta
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Display Helpers (Rich-based)
-# ═══════════════════════════════════════════════════════════════════════════
 
-def banner():
+# Display Helpers (Rich-based)
+
+def banner() -> None:
     """Print the converter banner using Rich Panel."""
     console.print()
     console.print(Panel(
         "[bold]GGUF → MLX Converter[/bold]\n"
         "[dim]with Dynamic Quantization for Apple Silicon Macs[/dim]",
-        border_style="bold cyan",
+        border_style=_STYLE_BOLD_CYAN,
         padding=(1, 2),
     ))
     console.print()
 
 
-def step(n: int, total: int, label: str):
+def step(n: int, total: int, label: str) -> None:
     """Print a pipeline step header using Rich Rule."""
     console.print()
     console.print(Rule(
@@ -728,67 +804,94 @@ def step(n: int, total: int, label: str):
     ))
 
 
-def ok(msg: str):
+def ok(msg: str) -> None:
     console.print(f"  [green]✓[/green] {msg}")
 
 
-def fail(msg: str):
+def fail(msg: str) -> None:
     console.print(f"\n  [red]✗[/red] {msg}")
 
 
-def info(msg: str):
+def info(msg: str) -> None:
     console.print(f"  [dim]·[/dim] {msg}")
 
 
-def warn(msg: str):
+def warn(msg: str) -> None:
     console.print(f"  [yellow]⚠[/yellow]  {msg}")
 
 
-def run_with_spinner(
+def run_with_progress(
     cmd: list[str],
     description: str,
+    progress: Progress,
     quiet: bool = False,
-) -> tuple[bool, "subprocess.CompletedProcess[str]" | None]:
-    """Run a subprocess with a Rich spinner, capturing output.
+) -> tuple[bool, str]:
+    """Run a subprocess with a live progress bar.
 
-    On failure, displays captured stdout/stderr with proper formatting.
-    Returns (True, None) on success, (False, result) on failure.
+    Parses output for percentage (N%) or fraction (N/M) patterns and
+    updates a Rich sub-task in real-time.
+
+    Returns (success, full_output).
     """
     if not quiet:
         info(f"Running: [dim]{' '.join(str(c) for c in cmd)}[/dim]")
 
-    try:
-        with console.status(
-            f"[bold cyan]{description}...[/bold cyan]",
-            spinner="dots",
-        ):
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+    op_task = progress.add_task(
+        f"[bold cyan]{description}", total=100, visible=not quiet
+    )
 
-        if result.returncode != 0:
-            fail(f"{description} failed (exit {result.returncode})")
-            if result.stderr:
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+        full_output: list[str] = []
+
+        assert process.stdout is not None  # PIPE ensures this
+        while True:
+            line = process.stdout.readline()
+            if not line and process.poll() is not None:
+                break
+            if line:
+                full_output.append(line)
+                # Match percentages (e.g. "45%")
+                pct_match = re.search(r"(\d+)%", line)
+                if pct_match:
+                    progress.update(op_task, completed=int(pct_match.group(1)))
+                # Match fractions (e.g. "10/100")
+                frac_match = re.search(r"(\d+)/(\d+)", line)
+                if frac_match:
+                    cur, tot = int(frac_match.group(1)), int(frac_match.group(2))
+                    if tot > 0:
+                        progress.update(op_task, completed=int((cur / tot) * 100))
+
+        process.wait()
+        output_text = "".join(full_output)
+
+        if process.returncode != 0:
+            fail(f"{description} failed (exit {process.returncode})")
+            if output_text:
                 console.print(Panel(
-                    result.stderr.strip()[-1000:],
+                    output_text.strip()[-1000:],
                     title="Error Output",
                     border_style="red",
                 ))
-            if result.stdout:
-                console.print(Panel(
-                    result.stdout.strip()[-500:],
-                    title="Last Output",
-                    border_style="dim",
-                ))
-            return False, result
-        return True, result
+            progress.remove_task(op_task)
+            return False, output_text
+
+        progress.update(op_task, completed=100)
+        progress.remove_task(op_task)
+        return True, output_text
 
     except FileNotFoundError as e:
         fail(f"Command not found: {e}")
-        return False, None
+        if 'op_task' in locals():
+            progress.remove_task(op_task)
+        return False, ""
 
 
 def format_size(size_bytes: float) -> str:
@@ -811,18 +914,131 @@ def format_time(seconds: float) -> str:
     return f"{h}h {m}m {s}s"
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Metadata Display (Rich Table)
-# ═══════════════════════════════════════════════════════════════════════════
 
-def display_metadata(meta: dict):
+# Registry & Download Support (Quick Win #1)
+
+def download_from_huggingface(repo_id: str, filename: str, cache_dir: Optional[Path] = None) -> Path:
+    """Download model from HuggingFace Hub.
+
+    Args:
+        repo_id: HuggingFace repo ID (e.g., "mistralai/Mistral-7B")
+        filename: Filename in repo (e.g., "Mistral-7B-Q4_K_M.gguf")
+        cache_dir: Cache directory for downloads (default: ~/.cache/gguf-to-mlx)
+
+    Returns:
+        Path to downloaded file
+    """
+    if not HAS_URLLIB:
+        fail("urllib not available for downloads")
+        sys.exit(1)
+
+    cache_dir = cache_dir or Path.home() / ".cache" / "gguf-to-mlx"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    local_path = cache_dir / f"{repo_id.replace('/', '_')}_{filename}"
+
+    # Skip if already cached
+    if local_path.exists():
+        ok(f"Using cached: {local_path}")
+        return local_path
+
+    url = f"https://huggingface.co/{repo_id}/resolve/main/{filename}"
+    ok(f"Downloading from HuggingFace: {repo_id}/{filename}")
+
+    try:
+        # Simple download with progress
+        def download_hook(block_num: int, block_size: int, total_size: int) -> None:
+            downloaded = block_num * block_size
+            if total_size > 0:
+                percent = min(100, int(100 * downloaded / total_size))
+                console.print(f"  Progress: {percent}%", end="\r")
+
+        urllib.request.urlretrieve(url, local_path, reporthook=download_hook)
+        console.print()  # newline after progress
+        ok(f"Downloaded: {local_path}")
+        return local_path
+    except Exception as e:
+        fail(f"Download failed: {e}")
+        sys.exit(1)
+
+
+def handle_registry_url(input_str: str) -> Path:
+    """Handle registry URLs like hf:namespace/model or return local path.
+
+    Examples:
+        hf:mistralai/Mistral-7B -> downloads from HuggingFace
+        /local/path/model.gguf -> returns as-is
+    """
+    if input_str.startswith("hf:"):
+        # HuggingFace format: hf:namespace/model/filename or hf:namespace/model
+        parts = input_str[3:].split("/")
+        if len(parts) >= 3:
+            repo_id = "/".join(parts[:-1])
+            filename = parts[-1]
+        elif len(parts) == 2:
+            repo_id = "/".join(parts)
+            filename = f"{parts[1]}-Q4_K_M.gguf"  # Default filename
+        else:
+            fail(f"Invalid HuggingFace URL: {input_str}")
+            fail("Format: hf:namespace/model or hf:namespace/model/filename.gguf")
+            sys.exit(1)
+        return download_from_huggingface(repo_id, filename)
+    else:
+        return Path(input_str).expanduser()
+
+
+
+# Conversion Time & Memory Estimation (Quick Win #3)
+
+def estimate_conversion_metrics(model_size_gb: float, bits: int, chip_tier: str = "base") -> dict[str, Any]:
+    """Estimate conversion time, peak memory, and final size.
+
+    Args:
+        model_size_gb: Size of GGUF model in GB
+        bits: Target quantization bits (2, 4, 8, 16)
+        chip_tier: Apple Silicon tier ('base', 'pro', 'max', 'ultra')
+
+    Returns:
+        dict with time_minutes, peak_memory_gb, final_size_gb, warnings
+    """
+    # Heuristics based on observed patterns
+    # Time: roughly 0.5-1.5 min per GB depending on chip and quant
+    chip_speed = {"base": 1.0, "pro": 1.3, "max": 1.5, "ultra": 1.5}.get(chip_tier, 1.0)
+    quant_complexity = {2: 0.3, 4: 0.7, 8: 0.9, 16: 1.2}.get(bits, 0.7)
+    time_minutes = max(1, int(model_size_gb * 0.8 * quant_complexity / chip_speed))
+
+    # Peak memory: roughly 3-4x model size during conversion
+    peak_memory_gb = model_size_gb * (4.5 - (bits / 4))  # Lower bits = more overhead
+
+    # Final size: roughly model_size * (bits / 16)
+    compression_ratio = bits / 16.0
+    final_size_gb = model_size_gb * compression_ratio
+
+    warnings = []
+    if peak_memory_gb > 48:
+        warnings.append(f"Peak memory {peak_memory_gb:.1f}GB may exceed M5 Max capacity")
+    if time_minutes > 120:
+        warnings.append(f"Conversion may take {time_minutes} minutes (2+ hours)")
+
+    return {
+        "time_minutes": time_minutes,
+        "peak_memory_gb": peak_memory_gb,
+        "final_size_gb": final_size_gb,
+        "warnings": warnings,
+    }
+
+
+
+# Metadata Display (Rich Table)
+
+def display_metadata(meta: dict[str, Any]) -> None:
     """Pretty-print GGUF metadata using Rich Table."""
 
     # Section 1: Model Info
     console.print()
     model_table = Table(
         title="GGUF Model Information",
-        title_style="bold cyan",
+        title_style=_STYLE_BOLD_CYAN,
         box=box.ROUNDED,
         border_style="dim",
         show_header=False,
@@ -941,7 +1157,7 @@ def display_metadata(meta: dict):
     if capabilities:
         cap_table = Table(
             title="Capabilities",
-            title_style="bold magenta",
+            title_style=_STYLE_BOLD_MAGENTA,
             box=box.ROUNDED,
             border_style="dim",
             show_header=False,
@@ -959,11 +1175,10 @@ def display_metadata(meta: dict):
             warn(w)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Inspect Mode
-# ═══════════════════════════════════════════════════════════════════════════
 
-def inspect_mode(gguf_path: Path):
+# Inspect Mode
+
+def inspect_mode(gguf_path: Path) -> None:
     """Run inspect mode: display metadata and exit."""
     info(f"Reading metadata from: [bold]{gguf_path.name}[/bold]")
 
@@ -996,9 +1211,8 @@ def inspect_mode(gguf_path: Path):
     sys.exit(0)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+
 # Preflight Checks
-# ═══════════════════════════════════════════════════════════════════════════
 
 def preflight_checks(
     gguf_path: Path,
@@ -1081,18 +1295,20 @@ def preflight_checks(
     return (len(errors) == 0, warnings, errors)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Validation
-# ═══════════════════════════════════════════════════════════════════════════
 
-def validate_output(output_dir: Path) -> bool:
-    """Try to load the converted model to verify it works."""
+# Validation
+
+def validate_output(output_dir: Path) -> None:
+    """Try to load the converted model to verify it works.
+    
+    Logs warnings on failure but never blocks the pipeline.
+    """
     try:
         import mlx.core as mx  # noqa: F401
         from mlx_lm.utils import load_config
     except ImportError:
         info("mlx_lm not available - skipping validation")
-        return True
+        return
 
     try:
         config = load_config(output_dir)
@@ -1107,15 +1323,12 @@ def validate_output(output_dir: Path) -> bool:
         if safetensors:
             total = sum(f.stat().st_size for f in safetensors)
             info(f"Weight files: {len(safetensors)} ({format_size(total)})")
-        return True
     except Exception as e:
         warn(f"Validation warning: {e}")
-        return True  # Don't fail - the files exist, just couldn't load
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+
 # Version checks
-# ═══════════════════════════════════════════════════════════════════════════
 
 def check_dependencies() -> dict[str, str | None]:
     """Check required and optional dependencies. Returns version info."""
@@ -1150,7 +1363,7 @@ def check_dependencies() -> dict[str, str | None]:
     return deps
 
 
-def ensure_deps(deps: dict, for_convert: bool = True):
+def ensure_deps(deps: dict[str, str | None], for_convert: bool = True) -> None:
     """Check required deps are installed, exit with helpful message if not."""
     missing = []
     if not deps.get("gguf2mlx"):
@@ -1167,29 +1380,35 @@ def ensure_deps(deps: dict, for_convert: bool = True):
         sys.exit(1)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+
 # Interactive Prompts (Rich-based)
-# ═══════════════════════════════════════════════════════════════════════════
 
 def get_gguf_path() -> Path:
     """Prompt the user for a GGUF file path (supports drag-and-drop)."""
-    console.print(
-        "  [yellow]→[/yellow] Drag your .gguf file into this window "
-        "and press Enter,"
-    )
-    console.print("    or type the full path:\n")
-    raw = Prompt.ask("  [bold]GGUF file[/bold]")
+    console.print()
+    console.print(Panel(
+        "Please provide the path to your .gguf model file.\n"
+        "You can [bold]drag and drop[/bold] the file into this window "
+        "or type the path manually.",
+        title="[bold cyan]Input Model[/bold cyan]",
+        border_style="cyan",
+        padding=(1, 2),
+    ))
+    raw = Prompt.ask("  [bold]GGUF file path[/bold]")
     return Path(raw.strip().strip("'\"").strip()).expanduser()
 
 
 def get_output_dir(gguf_path: Path) -> Path:
     """Suggest an output directory, let user override."""
     suggested = gguf_path.parent / (gguf_path.stem + "-4bit-mlx")
-    console.print(
-        f"\n  [yellow]→[/yellow] Output folder "
-        f"(press Enter to use default):"
-    )
-    console.print(f"    [dim]{suggested}[/dim]\n")
+    console.print()
+    console.print(Panel(
+        f"The model will be saved to a new directory.\n"
+        f"Default suggestion: [bold cyan]{suggested}[/bold cyan]",
+        title="[bold cyan]Output Directory[/bold cyan]",
+        border_style="cyan",
+        padding=(1, 2),
+    ))
     raw = Prompt.ask(
         "  [bold]Output folder[/bold]",
         default=str(suggested),
@@ -1197,9 +1416,8 @@ def get_output_dir(gguf_path: Path) -> Path:
     return Path(raw.strip().strip("'\"").strip()).expanduser()
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+
 # Disk Space Check
-# ═══════════════════════════════════════════════════════════════════════════
 
 def check_disk_space(
     gguf_path: Path,
@@ -1228,11 +1446,10 @@ def check_disk_space(
     return True
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Quant Args Builder
-# ═══════════════════════════════════════════════════════════════════════════
 
-def build_quant_args(args) -> list[str]:
+# Quant Args Builder
+
+def build_quant_args(args: argparse.Namespace) -> list[str]:
     """Build the mlx_lm convert quantisation arguments from CLI args."""
     q_args = ["--quantize"]
 
@@ -1249,11 +1466,10 @@ def build_quant_args(args) -> list[str]:
     return q_args
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Main Pipeline
-# ═══════════════════════════════════════════════════════════════════════════
 
-def main():
+# Main Pipeline
+
+def main() -> None:
     global console
 
     parser = build_parser()
@@ -1281,8 +1497,8 @@ def main():
         hw_table.add_column("", style="bold")
         hw_table.add_row("Chip", hw["chip_name"])
         tier_style = {
-            "max": "bold magenta",
-            "ultra": "bold magenta",
+            "max": _STYLE_BOLD_MAGENTA,
+            "ultra": _STYLE_BOLD_MAGENTA,
             "pro": "cyan",
         }.get(hw["chip_tier"], "")
         hw_table.add_row(
@@ -1299,7 +1515,7 @@ def main():
 
     # ── resolve GGUF path ─────────────────────────────────────────────────
     if args.input:
-        gguf_path = Path(args.input).expanduser()
+        gguf_path = handle_registry_url(args.input)  # Supports hf:namespace/model
     else:
         ensure_deps(deps, for_convert=False)  # Only minimal deps for interactive
         gguf_path = get_gguf_path()
@@ -1308,6 +1524,44 @@ def main():
     if args.inspect:
         inspect_mode(gguf_path)
         return  # unreachable, inspect_mode calls exit
+
+    # ── estimate mode ──────────────────────────────────────────────────────
+    if args.estimate:
+        gguf_size_gb = gguf_path.stat().st_size / 1e9
+        bits = args.bits or 4
+        estimates = estimate_conversion_metrics(gguf_size_gb, bits, hw.get("chip_tier", "base"))
+
+        console.print("\n[bold cyan]📊 Conversion Estimates[/bold cyan]")
+        est_table = Table(
+            title="Based on model size and target quantization",
+            title_style="dim",
+            box=box.SIMPLE,
+            border_style="dim",
+            show_header=False,
+        )
+        est_table.add_column("", style="dim", width=18)
+        est_table.add_column("", style="bold")
+        est_table.add_row("Model Size", f"{gguf_size_gb:.2f} GB")
+        est_table.add_row("Target Bits", f"{bits}-bit")
+        est_table.add_row(
+            "Est. Time",
+            f"~{estimates['time_minutes']} minutes"
+            if estimates['time_minutes'] > 1
+            else "< 1 minute",
+        )
+        est_table.add_row("Peak Memory", f"~{estimates['peak_memory_gb']:.1f} GB")
+        est_table.add_row("Final Size", f"~{estimates['final_size_gb']:.2f} GB")
+
+        if estimates["warnings"]:
+            console.print(est_table)
+            console.print("\n[bold yellow]⚠️  Warnings:[/bold yellow]")
+            for est_warn in estimates["warnings"]:
+                console.print(f"  • {est_warn}")
+        else:
+            console.print(est_table)
+
+        console.print("\n[dim]Run without --estimate to start conversion.[/dim]\n")
+        return
 
     # ── preflight checks ──────────────────────────────────────────────────
     # Resolve output dir early for preflight
@@ -1334,15 +1588,14 @@ def main():
         )
         sys.exit(1)
 
-    if not args.quiet and pre_warnings:
-        if not args.force:
-            ans = Confirm.ask(
-                "  [yellow]Warnings detected. Continue?[/yellow]",
-                default=True,
-            )
-            if not ans:
-                console.print("\n  Cancelled.")
-                sys.exit(0)
+    if not args.quiet and pre_warnings and not args.force:
+        ans = Confirm.ask(
+            "  [yellow]Warnings detected. Continue?[/yellow]",
+            default=True,
+        )
+        if not ans:
+            console.print(MSG_CANCELLED)
+            sys.exit(0)
 
     gguf_size_bytes = gguf_path.stat().st_size
     ok(f"Input: [bold]{gguf_path.name}[/bold]  ({format_size(gguf_size_bytes)})")
@@ -1350,21 +1603,71 @@ def main():
     # ── read metadata for smart decisions ─────────────────────────────────
     meta = read_gguf_metadata(gguf_path)
 
-    # Gemma4 bug detection - show structured warnings before conversion fails
+    # ── Pre-flight mlx_lm compatibility check ────────────────────────────────
+    if meta and not args.no_quantize:
+        arch = str(meta.get("architecture", "")).lower()
+        is_supported, reason = is_mlx_supported_arch(arch)
+        
+        if not is_supported:
+            console.print()
+            fail(f"Architecture '{meta.get('architecture', arch)}' is not supported by mlx_lm")
+            console.print()
+            console.print(f"  [dim]Reason: {reason}[/dim]")
+            console.print()
+            
+            # Check for known issues with workarounds
+            is_known, issue_info = is_known_issue_arch(arch)
+            if is_known and issue_info:
+                console.print("  [bold]Known issue:[/bold]")
+                console.print(f"  [dim]{issue_info['issue']}[/dim]")
+                console.print()
+                console.print("  [bold]Workarounds:[/bold]")
+                for i, (cmd, desc) in enumerate(issue_info['workarounds'], 1):
+                    console.print(f"  [dim]{i}.[/dim] [cyan]{cmd}[/cyan] — {desc}")
+                console.print()
+            
+            # Suggest alternatives
+            console.print("  [bold]Alternatives:[/bold]")
+            console.print("  [dim]1.[/dim] Use [cyan]--no-quantize[/cyan] for float16 MLX")
+            console.print("  [dim]2.[/dim] Use Ollama for native inference: brew install ollama")
+            console.print("  [dim]3.[/dim] Use llama.cpp directly: llama-cli -m model.gguf")
+            console.print()
+            
+            if not args.force:
+                ans = Confirm.ask(
+                    "  [yellow]Continue anyway? This may fail.[/yellow]",
+                    default=False,
+                )
+                if not ans:
+                    console.print(MSG_CANCELLED)
+                    sys.exit(0)
+            else:
+                warn("Continuing with --force flag.")
+
+    # Gemma4 bug detection - show structured warnings before conversion fails (Quick Win #2)
     if meta:
         arch = str(meta.get("architecture", "")).lower()
         is_known, issue_info = is_known_issue_arch(arch)
         if is_known and issue_info:
             console.print()
-            console.print(
-                f"[yellow]⚠[/yellow]  [bold]{meta['architecture']}[/bold] "
-                f"detected - known gguf2mlx issue: [dim]{issue_info['issue']}[/dim]"
+            # Improved error message with better formatting
+            issue_panel = Panel(
+                f"[bold]{meta['architecture']}[/bold] detected\n"
+                f"[dim]Known gguf2mlx issue:[/dim] {issue_info['issue']}",
+                title="[bold yellow]⚠  Known Architecture Issue[/bold yellow]",
+                border_style="yellow",
+                expand=False,
             )
-            console.print()
-            console.print("  [bold]If conversion fails, use one of these workarounds:[/bold]")
+            console.print(issue_panel)
+            console.print("[bold]Recommended Solutions:[/bold]")
             for i, (cmd, desc) in enumerate(issue_info['workarounds'], 1):
-                console.print(f"  [dim]{i}.[/dim] [cyan]{cmd}[/cyan] - {desc}")
-            console.print()
+                console.print(
+                    f"\n  [bold cyan]Option {i}:[/bold cyan] {desc}")
+                console.print(f"  [dim cyan]Command:[/dim cyan] [code]{cmd}[/code]")
+            console.print(
+                "\n[dim]The conversion may fail during quantization. "
+                "If it does, try one of the options above.[/dim]\n"
+            )
 
     if meta and not args.quiet:
         # Show key info
@@ -1418,12 +1721,12 @@ def main():
         intermediate_dtype = args.dtype
     elif meta and meta.get("file_type") == 0:  # F32 source
         intermediate_dtype = "float32"
-        info(f"Auto-detected dtype: [bold]float32[/bold] (source is float32)")
+        info("Auto-detected dtype: [bold]float32[/bold] (source is float32)")
     elif meta and meta.get("file_type") == 26:  # BF16 source
         intermediate_dtype = "float16"
         info(
-            f"Auto-detected dtype: [bold]float16[/bold] "
-            f"(source is bfloat16)"
+            "Auto-detected dtype: [bold]float16[/bold] "
+            "(source is bfloat16)"
         )
     else:
         intermediate_dtype = "float16"
@@ -1431,8 +1734,42 @@ def main():
     # ── resolve output dir ────────────────────────────────────────────────
     if not args.output:
         final_dir = get_output_dir(gguf_path)
+    else:
+        final_dir = Path(args.output).expanduser()
+
+    # Cleanup old intermediates if requested
+    if args.cleanup_old:
+        info("Cleaning up old intermediate directories...")
+        parent = final_dir.parent
+        old_intermediates = list(parent.glob("*_intermediate"))
+        for folder in old_intermediates:
+            try:
+                shutil.rmtree(folder)
+                info(f"  Removed: {folder.name}")
+            except Exception as e:
+                warn(f"  Could not remove {folder.name}: {e}")
+        if not old_intermediates:
+            info("  No old intermediate directories found.")
 
     intermediate_dir = final_dir.parent / (final_dir.name + "_intermediate")
+
+    # ── Resume check ──────────────────────────────────────────────────────
+    skip_step1 = False
+    if args.resume or intermediate_dir.exists():
+        if args.resume:
+            skip_step1 = True
+            info("Resume flag detected. Skipping Step 1 (using existing intermediate).")
+        elif not args.quiet:
+            console.print()
+            ans = Confirm.ask(
+                f"  [yellow]Found existing intermediate files at:[/yellow]\n"
+                f"  [dim]{intermediate_dir}[/dim]\n"
+                f"  [bold]Skip Step 1 and proceed directly to quantization?[/bold]",
+                default=True,
+            )
+            if ans:
+                skip_step1 = True
+                info("Skipping Step 1.")
 
     # ── resolve quantisation params ───────────────────────────────────────
     do_quantize = not args.no_quantize
@@ -1479,48 +1816,62 @@ def main():
     # ── disk space check ──────────────────────────────────────────────────
     final_dir.parent.mkdir(parents=True, exist_ok=True)
     if not args.force and not check_disk_space(gguf_path, final_dir):
-        console.print("\n  Cancelled.")
+        console.print(MSG_CANCELLED)
         sys.exit(0)
 
     # ── plan summary ──────────────────────────────────────────────────────
     if not args.quiet:
         console.print()
         plan_table = Table(
-            title="Conversion Plan",
-            title_style="bold",
-            box=box.SIMPLE,
+            title="Conversion Pipeline Plan",
+            title_style=_STYLE_BOLD_CYAN,
+            box=box.ROUNDED,
             border_style="dim",
-            show_header=False,
+            show_header=True,
         )
-        plan_table.add_column("", style="dim", width=8)
-        plan_table.add_column("")
-        plan_table.add_row(
-            "Step 1",
-            f"Convert GGUF → MLX [bold]{intermediate_dtype}[/bold]  "
-            f"[dim]→ {intermediate_dir.name}[/dim]",
-        )
+        plan_table.add_column("Step", style="bold", width=10)
+        plan_table.add_column("Action", style="white")
+        plan_table.add_column("Status", style="dim", width=15)
+
+        # Step 1
+        if skip_step1:
+            plan_table.add_row(
+                "Step 1",
+                f"Convert GGUF → MLX [bold]{intermediate_dtype}[/bold]",
+                "[yellow]SKIPPED[/yellow]"
+            )
+        else:
+            plan_table.add_row(
+                "Step 1",
+                f"Convert GGUF → MLX [bold]{intermediate_dtype}[/bold]",
+                STATUS_READY
+            )
+        
+        # Step 2
         if do_quantize:
             quant_desc = f"{args.bits}-bit"
             if args.predicate:
                 quant_desc = args.predicate
             plan_table.add_row(
                 "Step 2",
-                f"Quantise to [bold]{quant_desc}[/bold] MLX  "
-                f"[dim]→ {final_dir.name}[/dim]",
+                f"Quantise to [bold]{quant_desc}[/bold] MLX",
+                STATUS_READY
             )
+            # Step 3
             plan_table.add_row(
                 "Step 3",
                 "Clean up intermediate files",
+                STATUS_READY
             )
         else:
             plan_table.add_row(
                 "Output",
-                f"[dim]→ {final_dir.name}[/dim]",
+                "Save float16 model directly",
+                STATUS_READY
             )
         console.print(plan_table)
 
-    if not args.force:
-        if not args.quiet:
+    if not args.force and not args.quiet:
             console.print()
             console.print(
                 "  [yellow]This may take several minutes for large models.[/yellow]"
@@ -1537,202 +1888,228 @@ def main():
     progress = Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
+        BarColumn(bar_width=40),
         TaskProgressColumn(),
+        TimeRemainingColumn(),
         console=console,
         disable=args.quiet,
     )
+
+    # Track conversion success for auto-cleanup
+    conversion_success = False
 
     with progress:
         pipeline_task = progress.add_task(
             "[bold cyan]Pipeline[/bold cyan]", total=total_steps
         )
 
-        # ═══════════════════════════════════════════════════════════════════
-        # STEP 1 - GGUF → MLX float
-        # ═══════════════════════════════════════════════════════════════════
-        t0 = time.time()
+        try:
+            # ═══════════════════════════════════════════════════════════════════
+            # STEP 1 - GGUF → MLX float
+            # ═══════════════════════════════════════════════════════════════════
+            t0 = time.time()
 
-        ensure_deps(deps, for_convert=True)
-        step(1, total_steps, f"Converting GGUF → MLX ({intermediate_dtype} safetensors)")
-
-        intermediate_dir.mkdir(parents=True, exist_ok=True)
-        ok_step1, result_step1 = run_with_spinner(
-            [
-                sys.executable, "-m", "gguf2mlx",
-                "--input", str(gguf_path),
-                "--output", str(intermediate_dir),
-                "--dtype", intermediate_dtype,
-            ],
-            (
-                f"Converting GGUF to MLX {intermediate_dtype} "
-                "(this may take 5-30 minutes)"
-            ),
-            quiet=args.quiet,
-        )
-
-        if not ok_step1:
-            # Detect architecture-specific gguf2mlx bugs
-            arch = str(meta.get("architecture", "")).lower() if meta else ""
-            is_known, issue_info = is_known_issue_arch(arch)
+            ensure_deps(deps, for_convert=True)
             
-            stderr_text = result_step1.stderr if result_step1 else ""
-            
-            if is_known and issue_info:
-                console.print()
-                fail(f"gguf2mlx failed on {meta.get('architecture', arch)} model")
-                console.print()
-                console.print("  [bold]Known issue:[/bold]")
-                console.print(f"  [dim]{issue_info['issue']}[/dim]")
-                console.print()
-                console.print("  [bold]Workarounds:[/bold]")
-                for i, (cmd, desc) in enumerate(issue_info['workarounds'], 1):
-                    console.print(f"  [dim]{i}.[/dim] [cyan]{cmd}[/cyan] — {desc}")
-                console.print()
-            else:
-                fail("Conversion failed. Check the error above.")
-            sys.exit(1)
+            if not skip_step1:
+                step(1, total_steps, f"Converting GGUF → MLX ({intermediate_dtype} safetensors)")
 
-        t1 = time.time()
-        ok(f"GGUF converted to MLX {intermediate_dtype} ({format_time(t1 - t0)})")
-        progress.update(pipeline_task, advance=1)
-        
-        # Check for Gemma4 tensor naming issues
-        arch = str(meta.get("architecture", "")).lower() if meta else ""
-        if arch in ("gemma4", "gemma3"):
-            tensor_fix_applied = fix_gemma4_tensor_names(intermediate_dir)
-            if tensor_fix_applied:
-                ok("Gemma4 tensor names fixed")
-        
-        if not do_quantize:
-            # Float16-only mode - move intermediate to final location
-            if intermediate_dir != final_dir:
-                if final_dir.exists():
-                    warn(f"Output directory exists, removing: {final_dir}")
-                    shutil.rmtree(final_dir)
-                shutil.move(str(intermediate_dir), str(final_dir))
-                ok(
-                    "Model saved to: "
-                    f"[bold cyan]{final_dir}[/bold cyan]"
+                intermediate_dir.mkdir(parents=True, exist_ok=True)
+                ok_step1, _output_step1 = run_with_progress(
+                    [
+                        sys.executable, "-m", "gguf2mlx",
+                        "--input", str(gguf_path),
+                        "--output", str(intermediate_dir),
+                        "--dtype", intermediate_dtype,
+                    ],
+                    (
+                        "Converting GGUF to MLX " + intermediate_dtype
+                        + " (this may take 5-30 minutes)"
+                    ),
+                    progress=progress,
+                    quiet=args.quiet,
                 )
-            # Done
-            final_size = sum(
-                f.stat().st_size
-                for f in final_dir.rglob("*")
-                if f.is_file()
-            )
-            console.print()
-            console.print(Panel(
-                "[bold green]✓ Done![/bold green]",
-                border_style="green",
-            ))
-            console.print()
-            console.print(
-                f"  Your MLX [bold]{intermediate_dtype}[/bold] model is ready at:"
-            )
-            console.print(f"  [bold cyan]{final_dir}[/bold cyan]  ({format_size(final_size)})")
-            console.print()
-            sys.exit(0)
 
-        # ═══════════════════════════════════════════════════════════════════
-        # STEP 2 - MLX float16 → Quantised
-        # ═══════════════════════════════════════════════════════════════════
-        step(2, total_steps, "Quantising to MLX")
+                if not ok_step1:
+                    # Detect architecture-specific gguf2mlx bugs
+                    arch = str(meta.get("architecture", "")).lower() if meta else ""
+                    is_known, issue_info = is_known_issue_arch(arch)
+                    
+                    if is_known and issue_info:
+                        console.print()
+                        fail(f"gguf2mlx failed on {(meta or {}).get('architecture', arch)} model")
+                        console.print()
+                        console.print("  [bold]Known issue:[/bold]")
+                        console.print(f"  [dim]{issue_info['issue']}[/dim]")
+                        console.print()
+                        console.print("  [bold]Workarounds:[/bold]")
+                        for i, (cmd, desc) in enumerate(issue_info['workarounds'], 1):
+                            console.print(f"  [dim]{i}.[/dim] [cyan]{cmd}[/cyan] — {desc}")
+                        console.print()
+                    else:
+                        fail("Conversion failed. Check the error above.")
+                    sys.exit(1)
 
-        quant_args = build_quant_args(args)
-        ok_step2, result_step2 = run_with_spinner(
-            [
-                sys.executable, "-m", "mlx_lm", "convert",
-                "--hf-path", str(intermediate_dir),
-                "--mlx-path", str(final_dir),
-                *quant_args,
-            ],
-            f"Quantising to {args.bits}-bit MLX (this may take several minutes)",
-            quiet=args.quiet,
-        )
-
-        if not ok_step2:
-            # Detect architecture-specific quantization issues
-            arch = str(meta.get("architecture", "")).lower() if meta else ""
-            is_known, issue_info = is_known_issue_arch(arch)
-            
-            # Check for mlx_lm tensor naming errors (Gemma4, Gemma3, etc.)
-            stderr_text = result_step2.stderr if result_step2 else ""
-            has_tensor_error = (
-                "Received" in stderr_text and "parameters not in model" in stderr_text
-            )
-            has_blk_error = "blk." in stderr_text
-            
-            if is_known or has_tensor_error or has_blk_error:
-                console.print()
-                fail(f"mlx_lm quantization failed on {meta.get('architecture', arch) or arch} model")
-                console.print()
-                
-                # Check for Gemma4/Gemma3 MoE tensor name mismatch
-                is_gemma_moe = is_known and arch in ("gemma4", "gemma3")
-                
-                if has_blk_error or is_gemma_moe:
-                    console.print("  [bold]Root cause:[/bold]")
-                    console.print("  [dim]Gemma4 MoE architectural mismatch with mlx_lm[/dim]")
-                    console.print("  [dim]GGUF is missing some layernorm tensors that mlx_lm expects[/dim]")
-                    console.print("  [dim]This is a known limitation for Gemma4 MoE models[/dim]")
-                    console.print()
-                
-                console.print("  [bold]Recommended options:[/bold]")
-                
-                # Show recommended option first (most practical)
-                console.print()
-                console.print("  [bold cyan]OPTION 1: Float16 (Recommended for Gemma4)[/bold cyan]")
-                console.print("  [dim]  cpmm model.gguf --no-quantize[/dim]")
-                console.print("  [dim]  • ~50GB, but mlx_lm generate works directly[/dim]")
-                console.print("  [dim]  • Best inference speed on Apple Silicon[/dim]")
-                console.print()
-                
-                console.print("  [bold cyan]OPTION 2: Ollama (Native Gemma4 support)[/bold cyan]")
-                console.print("  [dim]  brew install ollama && ollama run gemma4:27b[/dim]")
-                console.print("  [dim]  • Built-in 4-bit quantization[/dim]")
-                console.print("  [dim]  • Optimized for Apple Silicon[/dim]")
-                console.print()
-                
-                console.print("  [bold cyan]OPTION 3: Use pre-quantized GGUF directly[/bold cyan]")
-                console.print("  [dim]  • Your UD-Q4_K_XL GGUF is already 4-bit quantized[/dim]")
-                console.print("  [dim]  • Run llama.cpp: llama-cli -m model.gguf -p '...'[/dim]")
-                console.print()
-                
-                if intermediate_dir:
-                    console.print(f"  [dim]Float16 model available at: {intermediate_dir}[/dim]")
+                t1 = time.time()
+                ok(f"GGUF converted to MLX {intermediate_dtype} ({format_time(t1 - t0)})")
+                progress.update(pipeline_task, advance=1)
             else:
-                fail("Quantisation failed. Check the error above.")
-                if result_step2 and result_step2.stderr:
-                    fail(
-                        "The float16 intermediate is still at: "
-                        f"[dim]{intermediate_dir}[/dim]"
+                info("Skipping Step 1 as requested (resume mode).")
+                progress.update(pipeline_task, advance=1)
+            
+            # Check for Gemma4 tensor naming issues
+            arch = str(meta.get("architecture", "")).lower() if meta else ""
+            if arch in ("gemma4", "gemma3"):
+                fix_gemma4_tensor_names(intermediate_dir)
+            
+            # Float16-only mode - move intermediate to final location
+            if not do_quantize:
+                if intermediate_dir != final_dir:
+                    if final_dir.exists():
+                        warn(f"Output directory exists, removing: {final_dir}")
+                        shutil.rmtree(final_dir)
+                    shutil.move(str(intermediate_dir), str(final_dir))
+                    ok(
+                        "Model saved to: "
+                        f"[bold cyan]{final_dir}[/bold cyan]"
                     )
-            sys.exit(1)
+                # Done
+                final_size = sum(
+                    f.stat().st_size
+                    for f in final_dir.rglob("*")
+                    if f.is_file()
+                )
+                console.print()
+                console.print(Panel(
+                    "[bold green]✓ Done![/bold green]",
+                    border_style="green",
+                ))
+                console.print()
+                console.print(
+                    f"  Your MLX [bold]{intermediate_dtype}[/bold] model is ready at:"
+                )
+                console.print(f"  [bold cyan]{final_dir}[/bold cyan]  ({format_size(final_size)})")
+                console.print()
+                sys.exit(0)
 
-        t2 = time.time()
-        ok(
-            f"Model quantised to [bold]{args.bits}-bit[/bold] "
-            f"({format_time(t2 - t1)})"
-        )
-        progress.update(pipeline_task, advance=1)
+            # ═══════════════════════════════════════════════════════════════════
+            # STEP 2 - MLX float16 → Quantised
+            # ═══════════════════════════════════════════════════════════════════
+            step(2, total_steps, "Quantising to MLX")
 
-        # ═══════════════════════════════════════════════════════════════════
-        # STEP 3 - Clean up intermediate
-        # ═══════════════════════════════════════════════════════════════════
-        if not args.keep_intermediate:
-            step(3, total_steps, "Cleaning up intermediate files")
-            try:
-                shutil.rmtree(intermediate_dir)
-                ok("Intermediate files removed")
-            except Exception as e:
-                warn(f"Could not remove {intermediate_dir}: {e}")
-        else:
-            info(
-                "Intermediate files kept at: "
-                f"[dim]{intermediate_dir}[/dim]"
+            quant_args = build_quant_args(args)
+            ok_step2, output_step2 = run_with_progress(
+                [
+                    sys.executable, "-m", "mlx_lm", "convert",
+                    "--hf-path", str(intermediate_dir),
+                    "--mlx-path", str(final_dir),
+                    *quant_args,
+                ],
+                f"Quantising to {args.bits}-bit MLX (this may take several minutes)",
+                progress=progress,
+                quiet=args.quiet,
             )
-        progress.update(pipeline_task, advance=1)
+
+            if not ok_step2:
+                # Detect architecture-specific quantization issues
+                arch = str(meta.get("architecture", "")).lower() if meta else ""
+                is_known, issue_info = is_known_issue_arch(arch)
+                
+                # Check for mlx_lm tensor naming errors (Gemma4, Gemma3, etc.)
+                stderr_text = output_step2 or ""
+                has_tensor_error = (
+                    "Received" in stderr_text and "parameters not in model" in stderr_text
+                )
+                has_blk_error = "blk." in stderr_text
+                
+                if is_known or has_tensor_error or has_blk_error:
+                    console.print()
+                    fail(f"mlx_lm quantization failed on {(meta or {}).get('architecture', arch) or arch} model")
+                    console.print()
+                    
+                    # Check for Gemma4/Gemma3 MoE tensor name mismatch
+                    is_gemma_moe = is_known and arch in ("gemma4", "gemma3")
+                    
+                    if has_blk_error or is_gemma_moe:
+                        console.print("  [bold]Root cause:[/bold]")
+                        console.print("  [dim]Gemma4 MoE architectural mismatch with mlx_lm[/dim]")
+                        console.print("  [dim]GGUF is missing some layernorm tensors that mlx_lm expects[/dim]")
+                        console.print("  [dim]This is a known limitation for Gemma4 MoE models[/dim]")
+                        console.print()
+                    
+                    console.print("  [bold]Recommended options:[/bold]")
+                    
+                    # Show recommended option first (most practical)
+                    console.print()
+                    console.print("  [bold cyan]OPTION 1: Float16 (Recommended for Gemma4)[/bold cyan]")
+                    console.print("  [dim]  cpmm model.gguf --no-quantize[/dim]")
+                    console.print("  [dim]  • ~50GB, but mlx_lm generate works directly[/dim]")
+                    console.print("  [dim]  • Best inference speed on Apple Silicon[/dim]")
+                    console.print()
+                    
+                    console.print("  [bold cyan]OPTION 2: Ollama (Native Gemma4 support)[/bold cyan]")
+                    console.print("  [dim]  brew install ollama && ollama run gemma4:27b[/dim]")
+                    console.print("  [dim]  • Built-in 4-bit quantization[/dim]")
+                    console.print("  [dim]  • Optimized for Apple Silicon[/dim]")
+                    console.print()
+                    
+                    console.print("  [bold cyan]OPTION 3: Use pre-quantized GGUF directly[/bold cyan]")
+                    console.print("  [dim]  • Your UD-Q4_K_XL GGUF is already 4-bit quantized[/dim]")
+                    console.print("  [dim]  • Run llama.cpp: llama-cli -m model.gguf -p '...'[/dim]")
+                    console.print()
+                    
+                    if intermediate_dir:
+                        console.print(f"  [dim]Float16 model available at: {intermediate_dir}[/dim]")
+                else:
+                    fail("Quantisation failed. Check the error above.")
+                    if output_step2:
+                        fail(
+                            "The float16 intermediate is still at: "
+                            f"[dim]{intermediate_dir}[/dim]"
+                        )
+                sys.exit(1)
+
+            t2 = time.time()
+            ok(
+                f"Model quantised to [bold]{args.bits}-bit[/bold] "
+                f"({format_time(t2 - t1)})"
+            )
+            progress.update(pipeline_task, advance=1)
+
+            # ═══════════════════════════════════════════════════════════════════
+            # STEP 3 - Clean up intermediate
+            # ═══════════════════════════════════════════════════════════════════
+            if not args.keep_intermediate:
+                step(3, total_steps, "Cleaning up intermediate files")
+                try:
+                    shutil.rmtree(intermediate_dir)
+                    ok("Intermediate files removed")
+                except Exception as e:
+                    warn(f"Could not remove {intermediate_dir}: {e}")
+            else:
+                info(
+                    "Intermediate files kept at: "
+                    f"[dim]{intermediate_dir}[/dim]"
+                )
+            progress.update(pipeline_task, advance=1)
+            
+            # Mark conversion as successful
+            conversion_success = True
+        
+        except Exception as e:
+            # Conversion failed - let finally handle cleanup
+            fail(f"Conversion failed: {e}")
+            sys.exit(1)
+        
+        finally:
+            # Auto-cleanup on failure (unless --keep-intermediate)
+            if not conversion_success and not args.keep_intermediate:
+                try:
+                    if intermediate_dir.exists():
+                        shutil.rmtree(intermediate_dir)
+                        info("Cleaned up intermediate files after failure.")
+                except Exception as cleanup_error:
+                    warn(f"Failed to clean up {intermediate_dir}: {cleanup_error}")
 
     # ── validation ────────────────────────────────────────────────────────
     if not args.quiet:
@@ -1778,16 +2155,15 @@ def main():
 
     console.print()
 
-    quant_tag = f"{args.bits}-bit" if do_quantize else intermediate_dtype
-    console.print(f"  [bold]To generate text, run:[/bold]")
+    console.print("  [bold]To generate text, run:[/bold]")
     console.print(
-        f"  [cyan]python3 -m mlx_lm generate "
+        "  [cyan]python3 -m mlx_lm generate "
         f'--model "{final_dir}" --prompt "Hello"[/cyan]'
     )
     console.print()
-    console.print(f"  [bold]Or start an interactive chat:[/bold]")
+    console.print("  [bold]Or start an interactive chat:[/bold]")
     console.print(
-        f"  [cyan]python3 -m mlx_lm chat "
+        "  [cyan]python3 -m mlx_lm chat "
         f'--model "{final_dir}"[/cyan]'
     )
     console.print()

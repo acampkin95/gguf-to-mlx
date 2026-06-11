@@ -85,3 +85,8 @@ temp/
 # AI-only work directories (Claude Code)
 .aistore/
 .omc/
+# SonarQube
+.scannerwork/
+
+# Ralph loop state
+.ralph/
