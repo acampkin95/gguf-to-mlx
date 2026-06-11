@@ -2,99 +2,98 @@
 
 **Vision:** Make GGUF→MLX conversion seamless, reliable, and accessible for all Apple Silicon users.
 
-**Status:** v1.0.0 stable (production-ready for supported architectures)
+**Status:** v1.1.0 stable — 91.6% coverage, 209 tests, SonarQube clean
 
 ---
 
-## Current State: v1.0.0
+## Current State: v1.1.0
 
 ### ✅ Shipping Features
-- **Smart defaults** based on Apple Silicon chip & RAM
-- **CLI with guided + direct modes**
-- **Quantization presets** (quality, balanced, speed, auto)
-- **Architecture auto-detection**
-- **Gemma2/3/4 workarounds** (known issues + post-conversion fixes)
-- **Rich UI** with progress bars, tables, error messages
-- **28 passing tests** + full mypy compliance
+- **Smart defaults** based on Apple Silicon chip & RAM (M1–M5, all tiers)
+- **CLI with guided + direct modes** (Rich panels, colors, spinners)
+- **Quantization presets** (quality, balanced, speed, high-bandwidth, auto)
+- **Full parameter control** — `--bits`, `--group-size`, `--mode`, `--dtype`, `--predicate`
+- **Architecture auto-detection** with pre-flight compatibility checks
+- **Gemma2/3/4 + Qwen3.5 + DeepSeek-V3 workarounds** (known issues database)
+- **Rich UI** — progress bars with ETAs, plan tables with status badges, summary tables
+- **Conversion resume** — `--resume` flag skips completed steps
+- **Auto-cleanup** — removes intermediate dirs on failure, `--keep-intermediate` for debug
+- **`--cleanup-old`** — removes stale `*_intermediate` directories
+- **`--estimate`** mode — resource estimation without conversion
+- **`--inspect`** mode — display GGUF metadata without conversion
+- **`--high-bandwidth`** preset for M5 Max / Ultra devices
+- **HuggingFace download** — `hf:org/model` registry URLs
+- **Cost estimation** — RAM, disk, duration estimates before conversion
+- **209 passing tests**, 91.6% coverage, mypy --strict clean
+- **SonarQube** — 0 bugs, 0 vulnerabilities, 0% duplication
 
 ### ⚠️ Known Limitations
-- No pre-flight check for mlx_lm architecture support → Qwen3.5 fails after 1min
-- No conversion resume/caching → Must restart if Step 2 fails
-- Limited quantization control → Can't customize `group_size`, `mode`, `dtype`
 - No batch conversion → One model per CLI invocation
-- No detailed logging → Hard to debug failures
-- No intermediate cleanup on error → Clutter left behind
+- No structured logging to file → Console-only output
+- 4 Cognitive Complexity warnings (S3776) in large functions — requires architecture refactor
+- 2 regex security hotspots (controlled input, acceptable risk)
+- `main()` is 700 lines — needs splitting into sub-commands
 
 ---
 
-## Roadmap: v1.1 → v2.0
+## Release History
 
-### **v1.1: Stability & Fast-Fail** (Target: 2-3 weeks)
-
-**Goal:** Prevent wasted computation on unsupported architectures; enable graceful fallbacks.
-
-- [ ] **Pre-flight mlx_lm compatibility check**
-  - Scrape supported architectures from mlx_lm source
-  - Fail before Step 1 if unsupported
-  - Suggest fallbacks (Ollama, llama.cpp, web services)
-  - **Test:** Unit test for Qwen3.5 detection, e2e with unsupported arch
-
-- [ ] **Auto-cleanup intermediate dirs on error**
-  - Detect and remove failed intermediate directories
-  - Add `--keep-intermediate` flag for debugging
-  - Add `--cleanup-old` to remove old intermediates
-  - **Test:** Unit + e2e failure scenarios
-
-- [ ] **Conversion resume / skip completed steps**
-  - Add `--resume` flag to restart from specific step
-  - Detect existing intermediate directories
-  - Skip Step 1 if intermediate already present
-  - **Test:** Interrupt mid-conversion, resume, verify success
-
-- [ ] **Expand known issues database**
-  - Document Qwen3.5 → unsupported + workarounds
-  - Add Mixtral MoE edge cases
-  - Add bfloat16 compatibility notes
-  - **Test:** Unit test for issue lookup
-
-**Estimated effort:** ~1 week  
-**Impact:** Prevents user time waste on doomed conversions
+| Version | Focus | Status |
+|---------|-------|--------|
+| **v1.0.0** | MVP, single-file, smart defaults | ✅ Stable |
+| **v1.1.0** | 91% coverage, SonarQube, stability fixes | ✅ Released |
+| **v1.2** | Architecture refactor, logging | 📅 Next |
+| **v2.0** | Batch, integration tests, CI/CD | 📅 Planned |
 
 ---
 
-### **v1.2: User Customization** (Target: 2-3 weeks)
+## Roadmap: v1.2 → v2.0
 
-**Goal:** Unlock power-user fine-tuning; improve observability.
+### **v1.2: Architecture Refactor & Logging** (Target: 1-2 weeks)
 
-- [ ] **Quantization parameter controls**
-  - Add `--group-size` flag (8, 16, 32, 64, 128)
-  - Add `--mode` flag (affine, block_sparse)
-  - Add `--dtype` flag (float16, bfloat16, float32)
-  - Update help, docs, examples
-  - **Test:** Parameter validation, e2e with custom values
+**Goal:** Reduce cognitive complexity; add structured logging; improve maintainability.
 
-- [ ] **Detailed logging & debug mode**
+- [ ] **Refactor `main()` into sub-commands**
+  - Extract pipeline stages into `Pipeline` class with `run()` method
+  - Sub-command pattern: `convert`, `inspect`, `estimate`, `resume`
+  - Target: reduce `main()` complexity from 209 → <50
+  - **Test:** Existing 209 tests must still pass unchanged
+
+- [ ] **Refactor `read_gguf_metadata()` complexity (50 → <15)**
+  - Extract arch-specific metadata readers into dispatch table
+  - Separate SSM detection, MTP detection, quality classification
+  - **Test:** Existing mocked tests cover all paths
+
+- [ ] **Refactor `display_metadata()` complexity (18 → <15)**
+  - Extract panel builders for each metadata section
+  - **Test:** Existing display tests cover all paths
+
+- [ ] **Structured logging to file**
   - Add `--log-file` for conversion history
   - Add `--verbose` / `-v` flag
-  - Structured logging (JSON option)
+  - JSON structured logging option
   - Log: timestamp, step, status, command, duration
   - **Test:** Parse logs, verify format
 
-- [ ] **Cost estimation before conversion**
-  - Estimate peak RAM (model + buffers)
-  - Estimate disk space (source + intermediate + final + 20% margin)
-  - Estimate duration (model_size / throughput lookup)
-  - Fail early if insufficient resources
-  - **Test:** Edge cases (low RAM, low disk)
+- [ ] **Fix remaining SonarQube issues**
+  - Resolve 4 Cognitive Complexity warnings (S3776)
+  - Target: 0 open issues on SonarQube dashboard
 
-**Estimated effort:** ~1.5 weeks  
-**Impact:** Enable advanced workflows; better diagnostics
+**Estimated effort:** ~1-1.5 weeks
+**Impact:** Maintainable codebase; enables future batch features
 
 ---
 
-### **v2.0: Batch & Hardening** (Target: 3-4 weeks)
+### **v2.0: Batch & Integration Tests** (Target: 2-3 weeks)
 
 **Goal:** Production-grade reliability; enable bulk conversions.
+
+- [ ] **Integration test suite with real GGUF models**
+  - Download small test models (Phi-2 2.7B, Gemma2-2B, Llama3.2-1B)
+  - E2E tests: convert → verify output → load in mlx_lm
+  - Test matrix: 5-6 architectures × 2-3 quantization levels
+  - Target: push coverage from 91% → 95%+
+  - **Test:** 15-20 new e2e tests (~5-10 min runtime)
 
 - [ ] **Batch conversion**
   - Add `--batch-dir` to scan for all `.gguf` files
@@ -103,27 +102,25 @@
   - Resource checks: disk, memory per task
   - **Test:** e2e with 5+ models, verify all succeed
 
-- [ ] **Integration test suite**
-  - Download small test models (Phi-2, Gemma2-2B, Llama2-7B)
-  - E2E tests: convert → verify output → load in mlx_lm
-  - Test matrix: 5-6 architectures × 2-3 quantization levels
-  - CI/CD: GitHub Actions (macOS M-series runner)
-  - **Test:** 15-20 new e2e tests (~5-10 min runtime)
-
-- [ ] **Post-conversion validation**
+- [ ] **Post-conversion validation hardening**
   - Verify tokenizer.json loads in transformers
   - Verify config.json matches mlx_lm schema
   - Check safetensors file integrity (headers, tensor counts)
   - Optional: single inference pass to verify model loads
   - **Test:** Unit tests for validation rules
 
+- [ ] **CI/CD Pipeline**
+  - GitHub Actions on macOS M-series runner
+  - Run: mypy --strict, pytest --cov, sonar-scanner
+  - Quality gate: 90%+ coverage, 0 type errors
+  - **Test:** CI config validated
+
 - [ ] **Documentation**
   - Add TROUBLESHOOTING.md for common errors
   - Add ADVANCED.md for power users (custom params, batch, logging)
-  - Add ARCHITECTURE.md (design decisions)
-  - Expand README with examples
+  - Expand README with examples and architecture table
 
-**Estimated effort:** ~2-2.5 weeks  
+**Estimated effort:** ~2-2.5 weeks
 **Impact:** Production-ready; catch regressions automatically
 
 ---
@@ -134,90 +131,61 @@
   - Add `--benchmark` flag
   - Run inference on test dataset (GSM8K or MMLU)
   - Measure: tokens/sec, memory peak, quality score
-  - Compare quantized vs. float16 reference
   - **Estimated effort:** 1-2 weeks
 
 - [ ] **Model metadata enrichment**
   - Scrape HuggingFace for recommended quantization
-  - Cache locally (optional)
   - Display recommendations pre-conversion
   - **Estimated effort:** ~1 week
 
 - [ ] **Advanced features**
-  - Shell completion (bash/zsh)
-  - Config file support (`.gguf-to-mlx.rc`)
+  - Shell completion (bash/zsh/fish)
+  - Config file support (`.gguf-to-mlx.toml`)
   - Non-local models (HuggingFace URLs, download + convert)
   - Version auto-update checks
   - **Estimated effort:** 2-3 weeks total
 
 ---
 
-## Release Timeline
+## Success Metrics (Updated)
 
-| Version | Timeline | Focus | Status |
-|---------|----------|-------|--------|
-| **v1.0.0** | Now | MVP, single-file, smart defaults | ✅ Stable |
-| **v1.1** | +2-3w | Stability, fast-fail, resume | 🔄 Next |
-| **v1.2** | +4-6w | Power users, logging, costs | 📅 Planned |
-| **v2.0** | +7-11w | Batch, integration tests, CI/CD | 📅 Planned |
-| **v2.1+** | +12w+ | Premium features (optional) | 💡 Backlog |
-
----
-
-## Contributing
-
-Interested in helping? See issues labeled:
-- `good-first-issue` for newcomers
-- `help-wanted` for priority features
-- `stability` for Phase 1 work
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) (planned) for guidelines.
-
----
-
-## Feedback
-
-Have a model that fails? Found a gap?
-- Open an issue with error log and model name
-- Tag with `unsupported-arch` or `bug` as appropriate
-- Include: GGUF file size, quantization type, M-chip variant, error message
-
----
-
-## Success Metrics (3 months)
-
-| Metric | Target |
-|--------|--------|
-| **Test coverage** | 40+ unit + 15+ e2e tests |
-| **Unsupported architecture handling** | Pre-flight check 100% coverage |
-| **Error recovery** | Resume, cleanup, cost estimation implemented |
-| **User customization** | `--group-size`, `--mode`, `--dtype` flags |
-| **Batch support** | `--batch-dir`, `--batch-list`, `--parallel` |
-| **CI/CD** | E2E tests running on GitHub Actions |
-| **Documentation** | ROADMAP, TROUBLESHOOTING, ADVANCED guides |
+| Metric | v1.0 Target | v1.1 Actual | v2.0 Target |
+|--------|-------------|-------------|-------------|
+| **Test coverage** | 40+ unit tests | 209 tests, 91.6% | 230+ tests, 95%+ |
+| **Type safety** | mypy clean | ✅ mypy --strict | ✅ mypy --strict |
+| **SonarQube** | — | 0 bugs, 0 vulns | 0 issues total |
+| **Unsupported arch** | Pre-flight check | ✅ Done + known issues DB | Same |
+| **Error recovery** | Resume + cleanup | ✅ Done | Same |
+| **User customization** | `--group-size`, `--mode` | ✅ Done + `--dtype`, `--predicate` | Same |
+| **Batch support** | `--batch-dir`, `--parallel` | — | ✅ Target |
+| **CI/CD** | GitHub Actions | — | ✅ Target |
+| **Documentation** | ROADMAP | ✅ + SonarQube | TROUBLESHOOTING, ADVANCED |
 
 ---
 
 ## Architecture Decision Log
 
 ### Why single-file CLI? (Not modular)
-- ✅ Easy to install (copy 1 file)
+- ✅ Easy to install (copy 1 file, `pip install` deps)
 - ✅ No dependency management complexity
 - ✅ Fast startup, low overhead
 - ✅ Clear for users to understand flow
 
-Revisit if:
-- Grows beyond ~2,500 lines
-- Multiple entry points needed (daemon, API)
-- Complex state management required
+**Revisit when:** `main()` exceeds 300 lines after refactor → split into `cli/` package
 
 ### Why subprocess for gguf2mlx + mlx_lm?
 - ✅ Isolation: one tool failure doesn't crash CLI
-- ✅ Progress tracking: can stream output
+- ✅ Progress tracking: stream stdout for % and fraction patterns
 - ✅ Simplicity: no direct Python dependency on internals
 - ⚠️ Trade-off: harder to intercept errors
 
-Alternative: Direct Python function calls (Phase 2+)
+**Alternative for v2.0:** Direct Python function calls with error wrapping
+
+### Why 91% coverage ceiling?
+- Remaining 9% requires real GGUF files (integration tests)
+- `main()` edge paths with interactive prompts (stdin blocking)
+- Defensive error handlers for corrupted safetensors
+- **v2.0 integration tests** will close this gap
 
 ---
 
