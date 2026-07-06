@@ -273,8 +273,9 @@ class ConversionPlan:
 
 | Task | Priority | Effort | Detail |
 |------|----------|--------|--------|
-| Implement `--validate` mode | P1 | 2 days | GGUF vs MLX prompt comparison harness |
+| Implement `--validate` mode | P1 | 2 days | GGUF vs MLX prompt comparison, 3 metrics, chip-aware budget |
 | Bandwidth-adaptive validation prompts | P2 | 0.5 day | Short prompts M1/M2, long-context on M4/M5 |
+| `--validate-perplexity` MLX-only proxy | P2 | 1 day | Small held-out text shard, flag >20% perplexity delta |
 | Metadata propagation | P1 | 1 day | Write source_scheme, mode, calibrated status into output |
 | Calibration-aware quant (AWQ-lite) | P2 | 5 days | Optional per-channel quantization for hf-quality mode |
 | Per-tensor quantization strategy | P2 | 3 days | Different quant for lm_head vs attention vs MLP |
@@ -371,6 +372,129 @@ AGENTWORLD_RULES = ArchRule(
     },
 )
 ```
+
+---
+
+## Part 8: Validation Harness Design
+
+### 8.1 Goals
+
+- **Deterministic and reproducible** — fixed sampling (temp=0.0, seed=42)
+- **Three simple metrics** — keyword hit-rate, token overlap, length ratio (not just one score)
+- **Chip-aware prompt budget** — bounded runtime per bandwidth tier
+- **Graceful degradation** — skip GGUF side if `llama-cli` absent, skip MLX if `mlx_lm` absent
+
+### 8.2 CLI Flags
+
+```python
+analysis.add_argument("--validate", action="store_true",
+    help="Run lightweight GGUF vs MLX validation on a prompt suite")
+analysis.add_argument("--validate-prompts", type=str, metavar="PATH",
+    help="JSONL of prompts: {\"id\",\"task\",\"prompt\",\"expected_keywords\":[...]}")
+analysis.add_argument("--validate-max-tokens", type=int, default=128,
+    help="Generation cap per prompt (default: 128)")
+analysis.add_argument("--validate-temp", type=float, default=0.0,
+    help="Sampling temperature (default: 0.0 for deterministic)")
+```
+
+### 8.3 Chip-Aware Prompt Budget
+
+```python
+def qwen_validation_budget(hw: dict, gguf_size_bytes: int) -> int:
+    tier = hw.get("bandwidth_tier", "mid")
+    gen = hw.get("chip_gen", 0)
+    big_model = gguf_size_bytes > 15e9
+    if gen <= 1 and tier == "low":   return 4 if big_model else 6
+    if tier == "low":                return 6 if big_model else 8
+    if tier == "mid":                return 8 if big_model else 12
+    if tier == "high":               return 10 if big_model else 14
+    if tier == "ultra":              return 14 if big_model else 20
+    return 10
+```
+
+| Bandwidth Tier | Big Model (>15GB) | Small Model | Rationale |
+|----------------|-------------------|--------------|-----------|
+| `low` (M1 base) | 4 prompts | 6 | Minimal — avoid timeout |
+| `mid` (M1 Pro, M2–M5 base) | 8 | 12 | Good coverage, bounded runtime |
+| `high` (M3/M4 Pro/Max, M5 Pro) | 10 | 14 | Strong coverage for throughput chips |
+| `ultra` (M4/M5 Max) | 14 | 20 | Full suite — bandwidth is plentiful |
+
+### 8.4 Three Metrics
+
+```python
+def keyword_hit_rate(output: str, keywords: list[str]) -> float:
+    """Fraction of expected keywords found in output (0–1)."""
+    if not keywords: return 0.0
+    text = output.lower()
+    return sum(1 for kw in keywords if kw.lower() in text) / len(keywords)
+
+def token_overlap(a: str, b: str) -> float:
+    """Symmetric token overlap between two outputs (0–1)."""
+    a_t, b_t = a.split(), b.split()
+    if not a_t or not b_t: return 0.0
+    sa, sb = set(a_t), set(b_t)
+    return len(sa & sb) / ((len(sa) + len(sb)) / 2.0)
+```
+
+| Metric | What it detects | Good threshold |
+|--------|----------------|----------------|
+| `keyword_hit_rate` | Task-level accuracy loss from quantization | MLX ≥ GGUF - 0.05 |
+| `token_overlap` | Output divergence between GGUF and MLX | ≥ 0.4 average |
+| `length_ratio` | Truncation (ratio << 1) or verbosity (ratio >> 1) | 0.7–1.5 |
+
+**Regression rule:** If `avg_overlap < 0.4` AND `avg_kh_mlx + 0.05 < avg_kh_gguf`, emit a warning that quantization may be too aggressive.
+
+### 8.5 Runner Design
+
+```python
+def run_llama_cli(gguf_path, prompt, max_tokens, temp) -> str:
+    try:
+        proc = subprocess.run(
+            ["llama-cli", "-m", str(gguf_path), "-p", prompt,
+             "-n", str(max_tokens), "--temp", str(temp), "--seed", "42"],
+            capture_output=True, text=True, check=False)
+        return proc.stdout.strip()
+    except FileNotFoundError:
+        warn("llama-cli not found; skipping GGUF validation")
+        return ""
+
+def run_mlx_generate(model_dir, prompt, max_tokens, temp) -> str:
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "mlx_lm", "generate",
+             "--model", str(model_dir), "--prompt", prompt,
+             "--max-tokens", str(max_tokens), "--temperature", str(temp),
+             "--seed", "42"],
+            capture_output=True, text=True, check=False)
+        return proc.stdout.strip()
+    except FileNotFoundError:
+        warn("mlx_lm generate not available; skipping MLX validation")
+        return ""
+```
+
+Both runners use **identical sampling params** (temp, max_tokens, seed=42) for fair comparison.
+
+### 8.6 Output Format
+
+Rich table with per-prompt rows + aggregate summary:
+
+```
+╭─ Qwen GGUF vs MLX Validation ─╮
+│ ID         Task    KH GGUF  KH MLX  Overlap  GGUF len  MLX len │
+│ q-code-01  code    1.00     1.00    0.82     45        47       │
+│ q-reason-02 reason  0.67     0.50    0.55     98        87       │
+│ q-fact-03  fact    1.00     1.00    0.91     32        34       │
+│ ...                                                             │
+╰─────────────────────────────────────────────────────────────────╯
+Validation summary: avg overlap=0.73, avg KH GGUF=0.89, avg KH MLX=0.83
+```
+
+### 8.7 Future: `--validate-perplexity`
+
+Optional MLX-only perplexity proxy for when no GGUF baseline exists:
+- Compute perplexity on a small held-out text shard (~500 tokens)
+- Compare across different MLX quantization configs
+- Flag if perplexity delta > 20% between configs
 
 ---
 
@@ -529,6 +653,12 @@ The planner function applies bandwidth-tier rules **after** arch-specific rules,
 - [Markus Schall — MLX on Apple Silicon compared with Ollama](https://www.markus-schall.de/en/2025/09/mlx-on-apple-silicon-as-local-ki-compared-with-ollama-co/)
 - [FamStack — MLX vs GGUF isolating variables](https://famstack.dev/guides/mlx-vs-gguf-part-2-isolating-variables/)
 - [Cho.sh — M-series LLM benchmarking](https://cho.sh/E5B180)
+
+### Validation & Evaluation
+- [APXML — Evaluating Deployed Quantized LLMs](https://apxml.com/courses/practical-llm-quantization/chapter-6-evaluating-deploying-quantized-llms/evaluating-quantized-models)
+- [DeepChecks — Top LLM Quantization Methods Impact on Quality](https://deepchecks.com/top-llm-quantization-methods-impact-on-model-quality/)
+- [arxiv 2405.06001v1 — Quantization Evaluation Methods](https://arxiv.org/html/2405.06001v1)
+- [Cast.ai — Demystifying Quantization for LLMs](https://cast.ai/blog/demystifying-quantizations-llms/)
 
 ### Models & Architecture
 - [Qwen-AgentWorld HuggingFace](https://huggingface.co/Qwen/Qwen-AgentWorld-35B-A3B)
