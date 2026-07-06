@@ -1,9 +1,9 @@
 # GGUF→MLX Refactor Assessment & Model Support Roadmap
 
 **Date:** 2026-07-06  
-**Updated:** 2026-07-06 — added M1–M5 hardware bandwidth tier system  
+**Updated:** 2026-07-06 — gap review: dead count corrected (11→16), MODEL_REMAPPING documented, VLM scope, unified dataclasses, phase reordering, test strategy, rollback plan  
 **Scope:** Full codebase audit + Qwen/Gemma/LFM/AgentWorld model support roadmap  
-**mlx-lm version:** 0.31.3 (82+ architecture modules)
+**mlx-lm version:** 0.31.3 (107 real model modules, 11 utility/shared modules)
 
 ---
 
@@ -22,29 +22,32 @@
 
 ### 1.2 Critical Findings
 
-#### 🔴 CRITICAL: 82 Missing Architecture Mappings
+#### 🔴 CRITICAL: 16 Dead ARCH_MAP Entries
 
-Our `gguf2mlx/core.py` `ARCH_MAP` has **45 entries**. mlx-lm 0.31.3 supports **127+ architecture modules**. We are missing **82 architectures**, including every major model released since mid-2025:
+Our `gguf2mlx/core.py` `ARCH_MAP` has **45 entries**. After applying mlx-lm's `MODEL_REMAPPING` (which remaps e.g. `mistral→llama`, `kimi_k2→deepseek_v3`), **16 entries map to modules that don't exist in mlx-lm 0.31.3**:  
+`falcon`, `mpt`, `bert`, `bloom`, `refact`, `chatglm`, `baichuan`, `xverse`, `orion`, `codeshell`, `t5`, `jais`, `grok-1→grok`, `arctic`, `smolm`, `chameleon`.
 
-**Missing critical architectures:**
+**Replacement candidates** (where a successor module exists):  
+| Dead Entry | Successor in mlx-lm | Action |  
+|------------|-------------------|--------|  
+| `chatglm→chatglm` | `glm`, `glm4`, `glm4_moe` | Remap to `glm4` for recent models |  
+| `baichuan→baichuan` | `baichuan_m1` | Remap to `baichuan_m1` |  
+| `smolm→smolm` | `smollm3` | Remap to `smollm3` |  
+| `falcon→falcon` | `falcon_h1` | Remap to `falcon_h1` |  
+| `mistral→mistral` | remapped by mlx-lm to `llama` | **Works** — keep as-is |  
+| mpt, bert, bloom, refact, xverse, orion, codeshell, t5, jais, grok, arctic, chameleon | No replacement | Remove from ARCH_MAP |  
 
-| Priority | Architecture | mlx-lm module | Impact |
-|----------|-------------|---------------|--------|
-| P0 | Llama 4 | `llama4`, `llama4_text` | Meta's flagship 2025 release |
-| P0 | Qwen 3 | `qwen3` | Dense Qwen3 (not just MoE) |
-| P0 | Qwen 3.5 | `qwen3_5`, `qwen3_5_moe` | Latest Qwen generation |
-| P0 | Qwen AgentWorld | *(new)* | Just released July 2026 |
-| P0 | Gemma 4 | `gemma4`, `gemma4_text` | Google's latest, PLE architecture |
-| P1 | DeepSeek V3.2 | `deepseek_v32` | R1 successor |
-| P1 | Mistral 3 | `mistral3` | Latest Mistral |
-| P1 | Ministral 3 | `ministral3` | Small Mistral |
-| P1 | GLM 4 | `glm4`, `glm4_moe` | Zhipu AI flagship |
-| P1 | LFM 2 | `lfm2`, `lfm2_moe` | Meta's next-gen |
-| P2 | Kimi K2.5 | `kimi_k25` | Moonshot AI |
-| P2 | InternLM 3 | `internlm3` | Shanghai AI Lab |
-| P2 | Nemotron H | `nemotron_h` | NVIDIA |
+> **Note:** `mistral` is NOT dead — mlx-lm's `MODEL_REMAPPING` remaps `"mistral"` → `"llama"` transparently, so mistral GGUF files convert correctly via the llama module.
 
-Additionally, **10 entries in our ARCH_MAP map to mlx-lm modules that don't exist** (dead mappings): `falcon`, `mpt`, `bert`, `bloom`, `refact`, `chatglm`, `xverse`, `orion`, `grok`, `smolm`, `chameleon`.
+#### 🔴 CRITICAL: 80 Missing Architecture Mappings
+
+mlx-lm 0.31.3 has **107 real model modules** (excluding 11 utility/shared modules like `base`, `cache`, `pipeline`, `activations`, etc.). Our ARCH_MAP covers **29 working entries**. We are missing **80 architectures**:
+
+| Priority | Count | Key Architectures |
+|----------|-------|-------------------|
+| **P0** | 7 | `qwen3`, `qwen3_5`, `qwen3_5_moe`, `gemma4`, `gemma4_text`, `llama4`, `llama4_text` |
+| **P1** | 16 | `deepseek_v32`, `mistral3`, `ministral3`, `mixtral`, `glm4`/`glm4_moe`/`glm4_moe_lite`, `lfm2`/`lfm2_moe`, `kimi_k25`, `internlm3`, `nemotron_h`, `cohere2`, `qwen2_vl`, `gemma3_text`, `gemma3n` |
+| **P2** | 49 | `falcon_h1`, `hunyuan`, `jamba`, `olmo3`, `olmoe`, `mamba`, `mamba2`, `rwkv7`, `exaone_moe`/`exaone4`, `phi3small`, `phimoe`, `pixtral`, `plamo2`, `smollm3`, `qwen3_next`, `telechat3`, +30 more |
 
 #### 🔴 CRITICAL: Gemma4 MoE Conversion Broken
 
@@ -75,12 +78,47 @@ Qwen-AgentWorld-35B-A3B (released July 2026) uses a hybrid architecture with Qwe
 
 The existing `classify_source_quality()` warns about double quantization but **does not prevent it**. A Q4_K_M source can be re-quantized to 2-bit MLX without any hard stop. Per research from [arxiv 2505.02214v1], this causes sharp quality degradation especially for Qwen.
 
+**Missing from roadmap: GGUF file_type enum.** `_resolve_dtype()` checks `file_type==0` (F32) and `file_type==26` (BF16) but GGUF defines many more: 2=Q4_0, 3=Q4_1, 6=Q5_0, 7=Q5_1, 8=Q8_0, 10=Q2_K, 11=Q3_K, 12=Q4_K, 13=Q5_K, 14=Q6_K. These are critical for `classify_source_quality()` and the double-quant guard. Must be documented and referenced in the planner.
+
 #### 🟢 LOW: Test Coverage
 
 273 tests passing, 92% coverage on convert.py. But:
 - No tests for the vendored `gguf2mlx/core.py`
 - No integration tests that verify actual GGUF→MLX conversion produces loadable models
 - No architecture-specific conversion tests (e.g., Gemma4 MoE, Qwen3 MoE)
+- **No mock GGUF metadata tests** — can't test new ARCH_MAP entries without 10-50GB files. Must create lightweight mock GGUF fixtures (minimal metadata + tiny weight tensors) to validate mapping logic without real models.
+
+#### 🟢 LOW: Vision-Language Models (Out of Scope)
+
+mlx-lm supports several vision-language architectures: `qwen2_vl`, `qwen3_vl`, `qwen3_vl_moe`, `kimi_vl`, `lfm2-vl`, `pixtral`. These have additional vision encoder tensors (image embeddings, vision projection layers) that complicate GGUF→MLX conversion significantly. **VLMs are explicitly out of scope for this roadmap.** Rationale:
+- VLM GGUF files are extremely large (often 50-100GB+)
+- Vision encoder tensors require separate quantization strategies
+- mlx-lm's VLM modules have different weight layout expectations
+- Worth revisiting as a separate effort after core text-only support is solid
+
+#### 🟢 LOW: mlx-lm MODEL_REMAPPING Interaction
+
+mlx-lm 0.31.3 has a `MODEL_REMAPPING` dict in `utils.py` that transparently remaps certain `model_type` values before module lookup:
+
+```python
+MODEL_REMAPPING = {
+    "mistral": "llama",        # Mistral 7B uses llama module
+    "llava": "mistral3",       # LLaVA uses mistral3 module
+    "phi-msft": "phixtral",    # Microsoft Phi → PhiXtral
+    "falcon_mamba": "mamba",    # Falcon Mamba → Mamba module
+    "joyai_llm_flash": "deepseek_v3",  # JoyAI → DeepSeek V3
+    "kimi_k2": "deepseek_v3",  # Kimi K2 → DeepSeek V3
+    "qwen2_5_vl": "qwen2_vl",  # Qwen 2.5 VL → Qwen 2 VL
+    "minimax_m2": "minimax",
+    "iquestcoder": "llama",
+}
+```
+
+Our `ARCH_MAP` should target the **pre-remap** model_type (i.e., the value that mlx-lm's `load_model()` receives). Since `gguf2mlx/core.py` writes `config["model_type"]` from `ARCH_MAP` value, and `mlx_lm.utils.load_model()` then applies `MODEL_REMAPPING`, our ARCH_MAP values must match what `load_model()` expects *before* remapping. Currently this works correctly — our mapping produces `"mistral"` and mlx-lm remaps it to `"llama"`. But new entries must account for this chain.
+
+#### 🟢 LOW: Unknown Architecture Handling
+
+`gguf2mlx/core.py` `detect_architecture()` returns `"llama"` as safe default when the GGUF metadata doesn't contain a recognized architecture. This means truly unknown architectures silently produce llama-format output that's likely broken. The roadmap should add explicit unknown-arch warnings and a `--arch-override` flag for manual specification.
 
 ---
 
@@ -135,24 +173,40 @@ class ConversionMode(str, Enum):
 
 @dataclass
 class SourceQuantInfo:
-    file_type: int
-    risk: str               # "none"/"low"/"medium"/"high"/"severe"
-    scheme_label: str       # e.g. "MOSTLY_Q4_K_M"
-    arch: str               # e.g. "qwen3", "gemma4"
-    effective_bits: float   # Approximate effective bit-width
+    file_type: int              # GGUF file_type enum (0=F32, 2=Q4_0, ..., 26=BF16)
+    risk: str                    # "none"/"low"/"medium"/"high"/"severe"
+    scheme_label: str            # e.g. "MOSTLY_Q4_K_M"
+    arch: str                    # e.g. "qwen3", "gemma4"
+    effective_bits: float        # Approximate effective bit-width
+
+class ArchRule:
+    """Per-architecture quantization constraints."""
+    min_bits: int | None           # None = force FP16-only (no quant)
+    moe_preferred_bits: int | None # None = FP16-only for MoE experts
+    fp16_threshold_gb: float       # Models above this get FP16 default
+    requires_awq: bool            # Benefits from AWQ calibration
+    skip_tensors: list[str]        # Globs of tensors to skip during conversion
+    custom_config_overrides: dict[str, Any]  # Extra config.json fields
 
 @dataclass
 class ConversionPlan:
+    # Core conversion params
     mode: ConversionMode
     target_bits: int | None
     target_group_size: int | None
     target_mode: str | None
-    intermediate_dtype: str
+    intermediate_dtype: str        # float16 or bfloat16 (chip-aware)
     allow_double_quant: bool
-    arch: str
-    arch_module: str         # e.g. "qwen3" for arch_rules lookup
+    # Architecture
+    arch: str                     # GGUF architecture string (e.g. "qwen3")
+    arch_module: str               # mlx-lm module name (e.g. "qwen3")
+    arch_rule: ArchRule | None    # Applied arch-specific constraints
+    # Hardware awareness
+    bandwidth_tier: str            # "low"/"mid"/"high"/"ultra"
+    chip_gen: int                 # 1-5, for bf16/fp16 decisions
+    # Diagnostics
     warnings: list[str]
-    metadata: dict[str, Any]  # Propagated into output config.json
+    metadata: dict[str, Any]       # Propagated into output config.json
 ```
 
 ---
@@ -229,16 +283,31 @@ class ConversionPlan:
 
 ## Part 4: Phased Roadmap
 
-### Phase 1: Foundation (Week 1-2) — Architecture + Critical Model Gaps
+**Design principle:** Extract the package shell first (Phase 0), then add features into the extracted modules (Phases 1–3). This avoids the double-movement anti-pattern of adding features to convert.py then refactoring them out.
+
+### Phase 0: Package Shell Extraction (Week 1, first half) — "Move First"
+
+**Goal:** Create `gguf_to_mlx/` package skeleton, extract utilities from convert.py, no behavior change
+
+| Task | Priority | Effort | Detail |
+|------|----------|--------|--------|
+| Create `gguf_to_mlx/__init__.py` | P0 | 0.5 day | Package init with re-exports |
+| Extract `gguf_to_mlx/metadata.py` | P0 | 0.5 day | `read_gguf_metadata()`, `classify_source_quality()` from convert.py |
+| Extract `gguf_to_mlx/hardware.py` | P0 | 0.5 day | `detect_apple_silicon()`, `classify_bandwidth()`, `smart_defaults()` |
+| Extract `gguf_to_mlx/ui.py` | P0 | 0.5 day | `info()`, `warn()`, `success()`, Rich console setup |
+| Extract `gguf_to_mlx/hf.py` | P0 | 0.5 day | HuggingFace search/download helpers |
+| Wire imports in convert.py | P0 | 0.5 day | Replace local functions with package imports, all 273 tests still pass |
+
+### Phase 1: Foundation (Week 1 second half – Week 2) — Architecture + Critical Model Gaps
 
 **Goal:** Fix broken conversions, add ConversionPlan layer, support P0 models
 
 | Task | Priority | Effort | Detail |
 |------|----------|--------|--------|
-| Add `classify_bandwidth()` to `detect_apple_silicon()` | P0 | 0.5 day | 4-tier system: low/mid/high/ultra |
+| Add `classify_bandwidth()` to `hardware.py` | P0 | 0.5 day | 4-tier system: low/mid/high/ultra |
 | Update `_resolve_dtype()` with bf16/fp16 chip awareness | P0 | 0.5 day | M1/M2 → force fp16; M3+ → allow bf16 |
 | Update `smart_defaults()` to use `bandwidth_tier` | P0 | 0.5 day | Replace ram_gb/tier with tier-based rules |
-| Add `gguf_to_mlx/plan.py` + `planner.py` | P0 | 1 day | ConversionMode, SourceQuantInfo, ConversionPlan dataclasses |
+| Add `gguf_to_mlx/plan.py` + `planner.py` | P0 | 1 day | ConversionMode, SourceQuantInfo, ArchRule, ConversionPlan |
 | Add `--quality-mode` CLI flag | P0 | 0.5 day | preserve-source / hf-quality / speed |
 | Implement double-quant guard | P0 | 0.5 day | Block Q4→Q2 without `--allow-low-bits` |
 | Add Qwen-specific rules | P0 | 0.5 day | No ≤3-bit for Qwen in quality modes |
@@ -247,8 +316,10 @@ class ConversionPlan:
 | **Add Qwen 3.5 + 3.5 MoE to ARCH_MAP** | P0 | 0.5 day | `"qwen3_5": "qwen3_5"`, `"qwen3_5_moe": "qwen3_5_moe"` |
 | **Add Gemma 4 + 4 Text to ARCH_MAP** | P0 | 1 day | PLE architecture tensor mapping, fix layer_scalar bugs |
 | **Add Llama 4 + 4 Text to ARCH_MAP** | P0 | 1 day | MoE tensor naming, MLA attention layout |
-| Fix dead ARCH_MAP entries | P0 | 0.5 day | Remove 11 mappings to non-existent mlx-lm modules |
+| Fix dead ARCH_MAP entries | P0 | 0.5 day | Remove 16 dead mappings, remap 4 to successors |
 | Wire plan into `main()` / `main_with_file()` | P0 | 0.5 day | Apply plan to args before pipeline |
+| Add mock GGUF test fixtures | P0 | 1 day | Minimal metadata + tiny tensors for ARCH_MAP testing without real models |
+| Add `--arch-override` CLI flag | P1 | 0.25 day | Manual arch specification for unknown GGUF files |
 
 ### Phase 2: Model Expansion (Week 3-4) — P1 Models
 
@@ -259,13 +330,16 @@ class ConversionPlan:
 | Add DeepSeek V3.2 | P1 | 0.5 day | Extend deepseek_v3 mapping |
 | Add Mistral 3 + Ministral 3 | P1 | 0.5 day | New tensor naming convention |
 | Add Mixtral | P1 | 0.5 day | Standard MoE — should be straightforward |
-| Add GLM 4 + MoE | P1 | 1 day | ChatGLM successor, new naming |
+| Add GLM 4 + MoE + MoE Lite | P1 | 1 day | ChatGLM successor, new naming, `glm_moe_dsa` |
 | Add LFM 2 + MoE | P1 | 0.5 day | Meta's latest dense/MoE |
 | Add Kimi K2.5 | P1 | 0.5 day | Moonshot AI, deepseek_v3 remap |
 | Add InternLM 3 | P1 | 0.5 day | New naming from internlm2 |
 | Add Nemotron H | P1 | 0.5 day | NVIDIA's latest |
 | Add Qwen AgentWorld support | P1 | 2 days | Hybrid arch — extract Qwen3 backbone, document env head handling |
-| Add Cohere 2 | P2 | 0.5 day | command-r successor |
+| Add Cohere 2 | P1 | 0.5 day | command-r successor |
+| Add Gemma 3 Text + Gemma 3n | P1 | 0.5 day | Text-only and nano variants |
+| Add Qwen 2 VL | P1 | 0.5 day | Vision-language (minimal — document as partial support) |
+| Add PhiXtral + Phi3Small | P2 | 0.5 day | Microsoft Phi mixtral variants |
 
 ### Phase 3: Quality & Validation (Week 5-6)
 
@@ -274,6 +348,7 @@ class ConversionPlan:
 | Task | Priority | Effort | Detail |
 |------|----------|--------|--------|
 | Implement `--validate` mode | P1 | 2 days | GGUF vs MLX prompt comparison, 3 metrics, chip-aware budget |
+| Generalize validation beyond Qwen | P1 | 0.5 day | Arch-agnostic prompt suite, not Qwen-only |
 | Bandwidth-adaptive validation prompts | P2 | 0.5 day | Short prompts M1/M2, long-context on M4/M5 |
 | `--validate-perplexity` MLX-only proxy | P2 | 1 day | Small held-out text shard, flag >20% perplexity delta |
 | Metadata propagation | P1 | 1 day | Write source_scheme, mode, calibrated status into output |
@@ -281,17 +356,21 @@ class ConversionPlan:
 | Per-tensor quantization strategy | P2 | 3 days | Different quant for lm_head vs attention vs MLP |
 | Architecture auto-discovery | P2 | 1 day | Scan mlx-lm model directory to auto-populate ARCH_MAP |
 
-### Phase 4: Refactor (Week 7-8)
+**Performance budget:** The planning stage (hardware detect + plan + warnings) must add **<5% overhead** to total conversion time. Validation runs are opt-in (`--validate`) so excluded from this budget.
 
-**Goal:** Clean architecture, extract convert.py into modules
+### Phase 4: Quality Polish & Remaining Refactor (Week 7-8)
+
+**Goal:** Clean architecture, fix remaining debt, production readiness
 
 | Task | Priority | Effort | Detail |
 |------|----------|--------|--------|
-| Extract `gguf_to_mlx/` package | P1 | 3 days | Move metadata, hf, scan, config, ui modules |
 | Fix swallowed exceptions | P1 | 1 day | Add structured logging to all except blocks |
 | Type safety pass | P2 | 2 days | Reduce `dict[str, Any]` usage, fix mypy errors |
 | Add core.py unit tests | P1 | 2 days | Test tensor mapping, config building, tokenizer extraction |
-| Integration test suite | P2 | 3 days | Convert small GGUF files, verify mlx_lm.load() works |
+| Integration test suite | P2 | 3 days | Convert small GGUF files, verify `mlx_lm.load()` works |
+| Remaining P2 ARCH_MAP entries | P2 | 3 days | Falcon H1, Hunyuan, Jamba, Olmo3, Mamba, +batch |
+
+**Rollback strategy:** Each ARCH_MAP entry and arch rule is independently testable via mock GGUF fixtures (Phase 1). If a new entry breaks existing conversions, the specific entry can be reverted without affecting others. No feature flags needed — the modular `arch_rules.py` design means per-arch rules are isolated by definition.
 
 ---
 
@@ -313,8 +392,7 @@ main()
 
 ### 5.2 Arch-Specific Rules (in `arch_rules.py`)
 
-```python
-ARCH_RULES: dict[str, ArchRule] = {
+Rules use the unified `ArchRule` dataclass from §2.2. Example entries:
     "qwen": ArchRule(
         min_bits=4,                     # No ≤3-bit in quality modes
         moe_preferred_bits=8,           # 8-bit for MoE experts
@@ -348,6 +426,8 @@ ARCH_RULES: dict[str, ArchRule] = {
 }
 ```
 
+> **Note:** `ArchRule` fields (`min_bits`, `moe_preferred_bits`, `fp16_threshold_gb`, `requires_awq`, `skip_tensors`, `custom_config_overrides`) are defined in §2.2 `plan.py`. See §5.3 for an `ArchRule` with `skip_tensors` and `custom_config_overrides`.
+
 ### 5.3 Qwen AgentWorld Conversion Strategy
 
 ```python
@@ -375,16 +455,17 @@ AGENTWORLD_RULES = ArchRule(
 
 ---
 
-## Part 8: Validation Harness Design
+## Part 6: Validation Harness Design
 
-### 8.1 Goals
+### 6.1 Goals
 
 - **Deterministic and reproducible** — fixed sampling (temp=0.0, seed=42)
 - **Three simple metrics** — keyword hit-rate, token overlap, length ratio (not just one score)
 - **Chip-aware prompt budget** — bounded runtime per bandwidth tier
 - **Graceful degradation** — skip GGUF side if `llama-cli` absent, skip MLX if `mlx_lm` absent
+- **Arch-agnostic** — initial Qwen-focused prompt suite, but `--validate-prompts` JSONL allows any architecture. Phase 3 adds arch-agnostic defaults.
 
-### 8.2 CLI Flags
+### 6.2 CLI Flags
 
 ```python
 analysis.add_argument("--validate", action="store_true",
@@ -397,7 +478,7 @@ analysis.add_argument("--validate-temp", type=float, default=0.0,
     help="Sampling temperature (default: 0.0 for deterministic)")
 ```
 
-### 8.3 Chip-Aware Prompt Budget
+### 6.3 Chip-Aware Prompt Budget
 
 ```python
 def qwen_validation_budget(hw: dict, gguf_size_bytes: int) -> int:
@@ -419,7 +500,7 @@ def qwen_validation_budget(hw: dict, gguf_size_bytes: int) -> int:
 | `high` (M3/M4 Pro/Max, M5 Pro) | 10 | 14 | Strong coverage for throughput chips |
 | `ultra` (M4/M5 Max) | 14 | 20 | Full suite — bandwidth is plentiful |
 
-### 8.4 Three Metrics
+### 6.4 Three Metrics
 
 ```python
 def keyword_hit_rate(output: str, keywords: list[str]) -> float:
@@ -444,7 +525,7 @@ def token_overlap(a: str, b: str) -> float:
 
 **Regression rule:** If `avg_overlap < 0.4` AND `avg_kh_mlx + 0.05 < avg_kh_gguf`, emit a warning that quantization may be too aggressive.
 
-### 8.5 Runner Design
+### 6.5 Runner Design
 
 ```python
 def run_llama_cli(gguf_path, prompt, max_tokens, temp) -> str:
@@ -474,7 +555,7 @@ def run_mlx_generate(model_dir, prompt, max_tokens, temp) -> str:
 
 Both runners use **identical sampling params** (temp, max_tokens, seed=42) for fair comparison.
 
-### 8.6 Output Format
+### 6.6 Output Format
 
 Rich table with per-prompt rows + aggregate summary:
 
@@ -489,7 +570,7 @@ Rich table with per-prompt rows + aggregate summary:
 Validation summary: avg overlap=0.73, avg KH GGUF=0.89, avg KH MLX=0.83
 ```
 
-### 8.7 Future: `--validate-perplexity`
+### 6.7 Future: `--validate-perplexity`
 
 Optional MLX-only perplexity proxy for when no GGUF baseline exists:
 - Compute perplexity on a small held-out text shard (~500 tokens)
@@ -498,31 +579,32 @@ Optional MLX-only perplexity proxy for when no GGUF baseline exists:
 
 ---
 
-## Part 6: Success Metrics
+## Part 7: Success Metrics
 
 | Metric | Current | Phase 1 Target | Phase 4 Target |
-|--------|---------|----------------|----------------|
-| ARCH_MAP entries | 45 | 65 (+ Qwen3/3.5, Gemma4, Llama4, AgentWorld) | 100+ (auto-discovery) |
-| mlx-lm compatibility | ~35% | ~55% | ~85% |
+| ARCH_MAP entries (working) | 29 | 45 (+ P0 models, remap successors) | 90+ (auto-discovery) |
+| Dead ARCH_MAP entries | 16 | 0 (removed or remapped) | 0 |
+| mlx-lm compatibility | ~27% | ~42% | ~84% |
 | Broken MoE models | Gemma4 | Gemma4 fixed | All MoE working |
 | Double-quant guard | Warn only | Hard block | Configurable |
 | Quality validation | None | Basic | AWQ-calibrated |
-| convert.py lines | 4,249 | 4,249 (plan layer added) | ~800 (extracted to package) |
-| Test count | 273 | 300+ | 400+ |
+| convert.py lines | 4,249 | ~3,200 (extracted to package) | ~800 (thin CLI) |
+| Test count | 273 | 310+ (mock GGUF fixtures) | 400+ |
 | mypy errors | 4 | 4 | 0 |
+| Planning overhead | N/A | <5% of convert time | <5% |
 
 ---
 
-## Part 7: M1–M5 Hardware Bandwidth Tier System
+## Part 8: M1–M5 Hardware Bandwidth Tier System
 
-### 7.1 Problem Statement
+### 8.1 Problem Statement
 
 The current `smart_defaults()` uses only `chip_tier` and `ram_gb` — it doesn't account for:
 - **Memory bandwidth** (the strongest predictor of LLM tok/s on Apple Silicon)
 - **bf16 vs fp16** hardware support (M1/M2 emulate bf16 in software, M3+ has native support)
 - **Generation-specific capabilities** (M5 Neural Accelerators, M3+ bf16 native)
 
-### 7.2 Bandwidth Tier Classification
+### 8.2 Bandwidth Tier Classification
 
 Extend `detect_apple_silicon()` to add a `bandwidth_tier` field:
 
@@ -557,7 +639,7 @@ def classify_bandwidth(hw: dict[str, Any]) -> str:
 | `high` | M1/M2 Max/Ultra, M3/M4 Pro/Max, M5 Pro | ~307–546 GB/s | 14–70B models, 4-bit | 4-bit/group32, 6–8-bit for <7B in hf-quality |
 | `ultra` | M4 Max, M5 Max/Ultra | ~614+ GB/s | 30–400B MoE, any | 4-bit/group32 aggressive, 8-bit for supervisor models |
 
-### 7.3 bf16 vs fp16 Handling
+### 8.3 bf16 vs fp16 Handling
 
 **Critical difference:** M1/M2 emulate bf16 in software → 40–70% prefill penalty. M3+ has native bf16.
 
@@ -579,7 +661,7 @@ def _resolve_dtype(args, meta, hw) -> str:
     return "float16"
 ```
 
-### 7.4 Per-Generation Planner Rules
+### 8.4 Per-Generation Planner Rules
 
 #### M1 (low bandwidth, 8–16GB)
 - Clamp `target_bits ≤ 4` for models >6GB
@@ -611,23 +693,9 @@ def _resolve_dtype(args, meta, hw) -> str:
 - Bias toward MLX hf-quality for long-context generation
 - Validation harness: longer prompts on M4/M5 to probe long-context quality
 
-### 7.5 Integration Into ConversionPlan
+### 8.5 Integration Into ConversionPlan
 
-```python
-@dataclass
-class ConversionPlan:
-    mode: ConversionMode
-    target_bits: int | None
-    target_group_size: int | None
-    target_mode: str | None
-    intermediate_dtype: str
-    allow_double_quant: bool
-    arch: str
-    bandwidth_tier: str        # NEW: "low"/"mid"/"high"/"ultra"
-    chip_gen: int               # NEW: for bf16 decisions
-    warnings: list[str]
-    metadata: dict[str, Any]
-```
+The `ConversionPlan` dataclass (§2.2) already includes `bandwidth_tier` and `chip_gen` fields. No additional dataclass changes needed.
 
 The planner function applies bandwidth-tier rules **after** arch-specific rules, so Qwen's "no ≤3-bit" constraint takes priority over M1's bandwidth constraints, but both are enforced.
 
