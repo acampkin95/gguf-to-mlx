@@ -6,13 +6,14 @@ This project builds upon the work of many contributors and open-source projects.
 
 ## Core Conversion Engine
 
-### gguf2mlx (Upstream)
+### gguf2mlx (Vendored Internally)
 
 **Repository:** https://github.com/barrontang/gguf2mlx  
 **License:** MIT  
 **Author:** Barron Tang
 
-The `gguf2mlx` library provides the core conversion engine that this tool wraps. It handles:
+The `gguf2mlx` library (v2.0.2) is vendored into the `gguf2mlx/` package directory
+for self-contained maintenance. It handles:
 
 - GGUF metadata parsing and architecture detection
 - Tensor dequantization (Q2_K through F16)
@@ -90,14 +91,14 @@ Contributions are welcome! Please see the main [README.md](README.md) for develo
 
 ### Adding New Architectures
 
-1. Fork the [gguf2mlx](https://github.com/barrontang/gguf2mlx) repository
-2. Add architecture mapping in `src/gguf2mlx/gguf2mlx.py`
+1. Edit the vendored source in `gguf2mlx/core.py`
+2. Add architecture mapping to the `ARCH_MAP` and/or tensor name remapping functions
 3. Test with a representative GGUF file
-4. Submit a PR to the upstream project
+4. Run the test suite: `python3 -m pytest test_convert.py -v`
 
 ### Bug Reports
 
-- **Conversion issues:** Report to [gguf2mlx](https://github.com/barrontang/gguf2mlx/issues)
+- **Conversion engine issues:** Fix directly in `gguf2mlx/core.py` — consider upstream PR
 - **CLI issues:** Report to this project's issue tracker
 
 ---

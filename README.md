@@ -72,11 +72,12 @@ python3 convert.py model.gguf --inspect
 ## Installation
 
 ```bash
-# Install the conversion engine
-pip install git+https://github.com/acampkin95/gguf2mlx.git
+# No external conversion engine needed — gguf2mlx is bundled
+# Just install the dependencies:
+pip install -e .
 
-# Or if you have the repo locally
-pip install -e /path/to/gguf2mlx-fork
+# Or install dependencies manually:
+pip install gguf mlx mlx-lm safetensors transformers rich tqdm psutil requests
 
 # Run the converter
 python3 convert.py model.gguf

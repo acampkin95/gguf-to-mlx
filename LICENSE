@@ -26,13 +26,14 @@ SOFTWARE.
 
 This project includes and builds upon the following open-source projects:
 
-### gguf2mlx
+### gguf2mlx (Vendored)
 **Repository:** https://github.com/barrontang/gguf2mlx  
 **License:** MIT  
 **Author:** Barron Tang
 
-The `gguf2mlx` library is the core conversion engine used by this project. 
-Its license terms apply to that component.
+The `gguf2mlx` library (v2.0.2) is vendored into `gguf2mlx/` as an internal module.
+Modifications may be applied directly for maintenance. The original MIT license
+applies to the vendored source files (`gguf2mlx/core.py`).
 
 ### Apple MLX
 **Repository:** https://github.com/ml-explore/mlx  
