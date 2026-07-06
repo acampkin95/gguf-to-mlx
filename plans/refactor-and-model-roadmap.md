@@ -1,6 +1,7 @@
 # GGUF→MLX Refactor Assessment & Model Support Roadmap
 
 **Date:** 2026-07-06  
+**Updated:** 2026-07-06 — added M1–M5 hardware bandwidth tier system  
 **Scope:** Full codebase audit + Qwen/Gemma/LFM/AgentWorld model support roadmap  
 **mlx-lm version:** 0.31.3 (82+ architecture modules)
 
@@ -234,6 +235,9 @@ class ConversionPlan:
 
 | Task | Priority | Effort | Detail |
 |------|----------|--------|--------|
+| Add `classify_bandwidth()` to `detect_apple_silicon()` | P0 | 0.5 day | 4-tier system: low/mid/high/ultra |
+| Update `_resolve_dtype()` with bf16/fp16 chip awareness | P0 | 0.5 day | M1/M2 → force fp16; M3+ → allow bf16 |
+| Update `smart_defaults()` to use `bandwidth_tier` | P0 | 0.5 day | Replace ram_gb/tier with tier-based rules |
 | Add `gguf_to_mlx/plan.py` + `planner.py` | P0 | 1 day | ConversionMode, SourceQuantInfo, ConversionPlan dataclasses |
 | Add `--quality-mode` CLI flag | P0 | 0.5 day | preserve-source / hf-quality / speed |
 | Implement double-quant guard | P0 | 0.5 day | Block Q4→Q2 without `--allow-low-bits` |
@@ -270,6 +274,7 @@ class ConversionPlan:
 | Task | Priority | Effort | Detail |
 |------|----------|--------|--------|
 | Implement `--validate` mode | P1 | 2 days | GGUF vs MLX prompt comparison harness |
+| Bandwidth-adaptive validation prompts | P2 | 0.5 day | Short prompts M1/M2, long-context on M4/M5 |
 | Metadata propagation | P1 | 1 day | Write source_scheme, mode, calibrated status into output |
 | Calibration-aware quant (AWQ-lite) | P2 | 5 days | Optional per-channel quantization for hf-quality mode |
 | Per-tensor quantization strategy | P2 | 3 days | Different quant for lm_head vs attention vs MLP |
@@ -384,13 +389,150 @@ AGENTWORLD_RULES = ArchRule(
 
 ---
 
+## Part 7: M1–M5 Hardware Bandwidth Tier System
+
+### 7.1 Problem Statement
+
+The current `smart_defaults()` uses only `chip_tier` and `ram_gb` — it doesn't account for:
+- **Memory bandwidth** (the strongest predictor of LLM tok/s on Apple Silicon)
+- **bf16 vs fp16** hardware support (M1/M2 emulate bf16 in software, M3+ has native support)
+- **Generation-specific capabilities** (M5 Neural Accelerators, M3+ bf16 native)
+
+### 7.2 Bandwidth Tier Classification
+
+Extend `detect_apple_silicon()` to add a `bandwidth_tier` field:
+
+```python
+# In convert.py — extend detect_apple_silicon() return dict
+def classify_bandwidth(hw: dict[str, Any]) -> str:
+    gen = hw["chip_gen"]
+    tier = hw["chip_tier"]
+    if gen == 1:
+        if tier in ("max", "ultra"): return "high"    # ~400–800 GB/s
+        elif tier == "pro":                return "mid"     # ~200 GB/s
+        else:                              return "low"     # ~68 GB/s
+    if gen == 2:
+        return "mid" if tier in ("pro", "base") else "high"
+    if gen == 3:
+        return "mid" if tier == "base" else "high"
+    if gen == 4:
+        return "mid" if tier == "base" else "high"
+    if gen >= 5:
+        if tier in ("max", "ultra"):  return "ultra"   # ~614 GB/s
+        elif tier == "pro":              return "high"    # ~307 GB/s
+        else:                            return "mid"     # ~153 GB/s
+    return "mid"
+```
+
+**Bandwidth tiers and their implications:**
+
+| Tier | Chips | Approx BW | Best Use | Quant Guidance |
+|------|-------|-----------|----------|---------------|
+| `low` | M1/M2 base | ~68 GB/s | 1–7B models, 4-bit | Clamp to 4-bit for >3GB, group_size≥128 |
+| `mid` | M1 Pro, M2 Pro/base, M3/M4/M5 base | ~150–200 GB/s | 3–14B models, 4–6-bit | 4-bit/group64 for large, 6-bit/group32 for small |
+| `high` | M1/M2 Max/Ultra, M3/M4 Pro/Max, M5 Pro | ~307–546 GB/s | 14–70B models, 4-bit | 4-bit/group32, 6–8-bit for <7B in hf-quality |
+| `ultra` | M4 Max, M5 Max/Ultra | ~614+ GB/s | 30–400B MoE, any | 4-bit/group32 aggressive, 8-bit for supervisor models |
+
+### 7.3 bf16 vs fp16 Handling
+
+**Critical difference:** M1/M2 emulate bf16 in software → 40–70% prefill penalty. M3+ has native bf16.
+
+Update `_resolve_dtype()` to accept `hw` parameter:
+
+```python
+def _resolve_dtype(args, meta, hw) -> str:
+    if args.dtype:
+        return str(args.dtype)
+    file_type = meta.get("file_type") if meta else None
+    # M1/M2: always use float16 (bf16 is emulated)
+    if hw.get("chip_gen", 0) <= 2:
+        if file_type == 0:
+            return "float32"
+        return "float16"  # Force fp16 even if source is bf16
+    # M3+: bf16 is native
+    if file_type == 26:  # MOSTLY_BF16
+        return "bfloat16"
+    return "float16"
+```
+
+### 7.4 Per-Generation Planner Rules
+
+#### M1 (low bandwidth, 8–16GB)
+- Clamp `target_bits ≤ 4` for models >6GB
+- Force `group_size ≥ 128` to reduce memory overhead
+- Always `intermediate_dtype = "float16"`
+
+#### M1 Pro/Max/Ultra (mid/high, more RAM)
+- Allow 8-bit for <3GB models in hf-quality mode
+- 4-bit/group64 for 3–15GB models
+- Keep bf16→fp16 conversion
+
+#### M2 (incremental over M1)
+- Same bf16 handling as M1 (still emulated)
+- Slightly more headroom; existing smart_defaults suffice
+
+#### M3 (bf16 native)
+- `intermediate_dtype = "bfloat16"` when source is BF16 (file_type 26)
+- No bf16→fp16 conversion needed
+- Pro/Max can handle 30B at 4-bit
+
+#### M4 (high bandwidth for Max)
+- M4 Max: ~546 GB/s, good for 30–70B at 4-bit
+- Annotate plan: "4-bit/group32 tuned for high-bandwidth; good for 30–70B Qwen"
+
+#### M5 (ultra bandwidth, Neural Accelerators)
+- M5 Max: ~614 GB/s, 128GB — ideal for large models
+- M5 base: ~153 GB/s, 32GB — great for dense 14B or MoE 30B
+- **Auto-upgrade speed→hf-quality for large models** on M5 Max/Ultra
+- Bias toward MLX hf-quality for long-context generation
+- Validation harness: longer prompts on M4/M5 to probe long-context quality
+
+### 7.5 Integration Into ConversionPlan
+
+```python
+@dataclass
+class ConversionPlan:
+    mode: ConversionMode
+    target_bits: int | None
+    target_group_size: int | None
+    target_mode: str | None
+    intermediate_dtype: str
+    allow_double_quant: bool
+    arch: str
+    bandwidth_tier: str        # NEW: "low"/"mid"/"high"/"ultra"
+    chip_gen: int               # NEW: for bf16 decisions
+    warnings: list[str]
+    metadata: dict[str, Any]
+```
+
+The planner function applies bandwidth-tier rules **after** arch-specific rules, so Qwen's "no ≤3-bit" constraint takes priority over M1's bandwidth constraints, but both are enforced.
+
+---
+
 ## Sources & Research
 
+### Quality & Quantization
 - [ContraCollective — GGUF vs MLX Quantization Formats 2026](https://contracollective.com/blog/gguf-vs-mlx-quantization-formats-apple-silicon-2026)
 - [MuhammadRaza — GGUF vs MLX Decision Guide](https://muhammadraza.me/2026/gguf-vs-mlx-decision-guide/)
 - [Latitude — Quantized LLMs Cost/Performance Results](https://latitude.so/blog/quantized-llms-cost-performance-results)
 - [arxiv 2505.02214v1 — Qwen Quantization Research](https://arxiv.org/html/2505.02214v1)
 - [Qwen docs — AWQ Quantization](https://qwen.readthedocs.io/en/latest/quantization/awq.html)
+- [GenerativeAI — Practical Guide to LLM Quantization](https://generativeai.pub/practical-guide-of-llm-quantization-gptq-awq-bitsandbytes-and-unsloth-bdeaa2c0bbf6)
+- [JarvisLabs — vLLM Quantization Guide](https://jarvislabs.ai/blog/vllm-quantization-complete-guide-benchmarks)
+
+### Hardware & Bandwidth
+- [Apple — M5 Pro and M5 Max announcement](https://www.apple.com/au/newsroom/2026/03/apple-debuts-m5-pro-and-m5-max-to-supercharge-the-most-demanding-pro-workflows/)
+- [Apple — M5 launch](https://www.apple.com/au/newsroom/2025/10/apple-unleashes-m5-the-next-big-leap-in-ai-performance-for-apple-silicon/)
+- [Apple ML Research — Exploring LLMs with MLX on M5](https://machinelearning.apple.com/research/exploring-llms-mlx-m5)
+- [LLMCheck — Apple Silicon Chips for AI comparison](https://llmcheck.net/compare/apple-silicon-chips-for-ai/)
+- [Parallels — Apple M Chips Guide](https://www.parallels.com/blogs/apple-m-chips-guide/)
+- [Markus Schall — MLX on Apple Silicon compared with Ollama](https://www.markus-schall.de/en/2025/09/mlx-on-apple-silicon-as-local-ki-compared-with-ollama-co/)
+- [FamStack — MLX vs GGUF isolating variables](https://famstack.dev/guides/mlx-vs-gguf-part-2-isolating-variables/)
+- [Cho.sh — M-series LLM benchmarking](https://cho.sh/E5B180)
+
+### Models & Architecture
 - [Qwen-AgentWorld HuggingFace](https://huggingface.co/Qwen/Qwen-AgentWorld-35B-A3B)
 - [mlx-lm GitHub (82+ model modules)](https://github.com/ml-explore/mlx-lm/)
 - [DeepWiki — mlx-lm Supported Models](https://deepwiki.com/ml-explore/mlx-lm/5.1-overview-and-supported-models)
+- [Qwen docs — GGUF quantization](https://qwen.readthedocs.io/en/v1.5/quantization/gguf.html)
+- [Atomic — GGUF vs MLX](https://atomic.chat/blog/guides/gguf-vs-mlx)
