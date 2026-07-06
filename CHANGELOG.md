@@ -13,6 +13,17 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [Unreleased]
+
+### Planned: Model Support Expansion + Quality Architecture
+- **ConversionPlan layer** — explicit architecture-aware quantization decisions (no double-quant, Qwen/Gemma rules)
+- **82 missing architectures** — Qwen 3/3.5/AgentWorld, Gemma 4, Llama 4, LFM 2, DeepSeek V3.2, Mistral 3
+- **Quality modes** — `preserve-source`, `hf-quality`, `speed` CLI flags
+- **Validation harness** — `--validate` mode for GGUF vs MLX quality comparison
+- See [`plans/refactor-and-model-roadmap.md`](plans/refactor-and-model-roadmap.md) for full phased plan
+
+---
+
 ## [1.3.0] - 2026-06-12
 
 ### Interactive Menu System
