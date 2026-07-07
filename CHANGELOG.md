@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased] - 2026-07-07
 
+### ROADMAP rewrite — reconcile to shipped reality + research-backed forward plan
+- **Re-baselined to v1.4.0** — prior ROADMAP still claimed "v1.1.0 stable / 209 tests / 91.6% coverage / main()=700 lines / mypy --strict clean", all of which were stale or false after v1.2–v1.4.0 shipped. Updated to actual: 326 tests, ~78% coverage, main()=187 lines, `convert.py` mypy clean (3 errors remain in vendored `core.py`).
+- **Release History** — moved v1.2/v1.3/v1.4.0 to ✅ shipped with accurate focuses.
+- **Forward plan folded in from Perplexity research** (`plans/refactor-and-model-roadmap.md` is authoritative): ConversionPlan + no-double-quant quality modes (T1), 82-arch expansion incl. Qwen3/3.5/AgentWorld + Gemma4 MoE (T2), M1–M5 bandwidth tiers + bf16/fp16 handling (T3), `--validate` harness (T4), AWQ/per-tensor quant (T5), metadata propagation (T6), package refactor (T7), batch/CI (T8). All marked **not-yet-implemented** (verified `ConversionPlan`/`--validate`/`--calibrate-awq` are absent from `convert.py`).
+- **ADRs fixed** — removed obsolete "subprocess for gguf2mlx" (v1.4.0 calls it directly) and "91% ceiling" rationales; added vendored-engine + GGUF-as-transport ADRs.
+- **GUI kept as a separate track** — referenced via `plans/MACOS_GUI_MASTERPLAN.md`, not in the milestone timeline.
+
 ### QC Pass — fix broken suite, latent bugs, and stale imports
 - **Test suite was silently broken** — `test_run_menu_handles_keyboard_interrupt` raised an uncaught `KeyboardInterrupt` that interrupted the whole suite at 277 tests (exit code 2), masking 6 downstream failures + 1 shadowed test class. Root cause: the main-menu `Prompt.ask()` sat outside the `try/except` in `run_interactive_menu()`, so Ctrl+C at the prompt crashed instead of exiting gracefully. Fixed by wrapping the prompt in its own handler that exits cleanly, while preserving "return to menu" for interrupts inside sub-actions.
 - **4 previously-dead tests now execute** — `TestFormatHelpers` was defined twice; the second class shadowed the first, so its 4 edge-case tests never ran. Renamed the first to `TestFormatHelpersEdgeCases`.

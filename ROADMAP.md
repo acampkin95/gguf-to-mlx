@@ -1,198 +1,162 @@
-# GGUF-to-MLX Roadmap
+# GGUF→MLX Roadmap
 
-**Vision:** Make GGUF→MLX conversion seamless, reliable, and accessible for all Apple Silicon users.
+**Vision:** Make GGUF→MLX conversion seamless, reliable, and *quality-preserving* for all Apple Silicon (M1–M5) users — treating GGUF as a transport format and recomputing MLX-native quantization where it improves fidelity.
 
-**Status:** v1.1.0 stable — 91.6% coverage, 209 tests, SonarQube clean
+**Status:** v1.4.0 stable — vendored engine, 326 tests, ~78 % coverage, ruff clean, `convert.py` mypy clean.
+
+> **Companion planning docs (authoritative detail):**
+> - [`plans/refactor-and-model-roadmap.md`](plans/refactor-and-model-roadmap.md) — full 8-part design: ConversionPlan layer, M1–M5 bandwidth tiers, validation harness, Qwen/AgentWorld strategy, phased schedule.
+> - [`plans/MACOS_GUI_MASTERPLAN.md`](plans/MACOS_GUI_MASTERPLAN.md) — the **macOS GUI track, run as a separate workstream** (v1.5.0). Not in the timeline below; tracked independently.
 
 ---
 
-## Current State: v1.1.0
+## Current State — v1.4.0 (2026-07-06)
 
-### ✅ Shipping Features
-- **Smart defaults** based on Apple Silicon chip & RAM (M1–M5, all tiers)
-- **CLI with guided + direct modes** (Rich panels, colors, spinners)
-- **Quantization presets** (quality, balanced, speed, high-bandwidth, auto)
-- **Full parameter control** — `--bits`, `--group-size`, `--mode`, `--dtype`, `--predicate`
-- **Architecture auto-detection** with pre-flight compatibility checks
-- **Gemma2/3/4 + Qwen3.5 + DeepSeek-V3 workarounds** (known issues database)
-- **Rich UI** — progress bars with ETAs, plan tables with status badges, summary tables
-- **Conversion resume** — `--resume` flag skips completed steps
-- **Auto-cleanup** — removes intermediate dirs on failure, `--keep-intermediate` for debug
-- **`--cleanup-old`** — removes stale `*_intermediate` directories
-- **`--estimate`** mode — resource estimation without conversion
-- **`--inspect`** mode — display GGUF metadata without conversion
-- **`--high-bandwidth`** preset for M5 Max / Ultra devices
-- **HuggingFace download** — `hf:org/model` registry URLs
-- **Cost estimation** — RAM, disk, duration estimates before conversion
-- **209 passing tests**, 91.6% coverage, mypy --strict clean
-- **SonarQube** — 0 bugs, 0 vulnerabilities, 0% duplication
+### ✅ Shipping
+- **Vendored `gguf2mlx` v2.0.2** — conversion engine lives in `gguf2mlx/`; `convert.py` calls `gguf2mlx.convert()` **directly** (no subprocess). Bugs fixable in-tree.
+- **Smart defaults** from Apple Silicon chip + RAM (M1–M5, all tiers).
+- **Full CLI** — guided menu + direct modes (Rich panels, spinners, progress with ETAs). 30 distinct flags.
+- **Quantization control** — `--bits {2,3,4,6,8}`, `--group-size {32,64,128,256}`, `--mode {affine,mxfp4,nvfp4,mxfp8}`, `--predicate`, `--dtype {float16,float32}`, `--no-quantize`, `--preset {speed,balanced,quality,m5-max}`, `--high-bandwidth`.
+- **Architecture auto-detection** + pre-flight compatibility checks; known-issues DB (`KNOWN_CONVERSION_ISSUES`) for Gemma2/3/4, Qwen3.5, DeepSeek-V3.
+- **HuggingFace hub** — `hf:org/model` registry URLs, `--hf-search/-s`, `--hf-download/-H`, `--hf-list/-l`, `--hf-file`, `--hf-token`, `--auto-convert/-C` (download → convert in one step, via streaming `requests`).
+- **Model management** — `--scan/-S` (omlx / LM Studio / HF cache / custom), `--models-dir`, `--set-models-dir`, `--delete-gguf`, persistent config at `~/.config/gguf-to-mlx/config.json`, last-10 history.
+- **Pipeline control** — `--resume`, `--keep-intermediate`, `--cleanup-old`, `--force`, intermediate-dir safety.
+- **Analysis** — `--inspect`, `--estimate`, `--mtp`.
+- **326 tests pass (exit 0)**; ruff clean; `convert.py` mypy clean (non-strict).
 
-### ⚠️ Known Limitations
-- No batch conversion → One model per CLI invocation
-- No structured logging to file → Console-only output
-- 4 Cognitive Complexity warnings (S3776) in large functions — requires architecture refactor
-- 2 regex security hotspots (controlled input, acceptable risk)
-- `main()` is 700 lines — needs splitting into sub-commands
+### ⚠️ Known Limitations (honest, refreshed)
+- **Coverage dropped to ~78 %** (was 91.6 % at v1.1.0) — v1.4.0 added the vendored engine wrapper, streaming download, auto-convert, and the full interactive-menu system faster than tests grew. Recovery is an explicit roadmap goal.
+- **3 mypy errors remain in vendored `gguf2mlx/core.py`** (out of scope for `convert.py`; see ADR). Makefile runs non-strict `mypy convert.py`.
+- **No `ConversionPlan` layer yet** — quantization decisions are ad-hoc; no architecture-aware "no-double-quant" guard, no AWQ calibration, no `--validate` harness. *(This is the v1.5 focus — see below.)*
+- **Qwen3 / Qwen3.5 are in `KNOWN_CONVERSION_ISSUES` (warn/fast-fail), not in `SUPPORTED_MLX_ARCHITECTURES`** — the supported set today has 21 entries (`qwen, qwen2, qwen2_5` plus llama/gemma/mistral/phi/deepseek families).
+- **`convert.py` is 4,200 LOC single-file** (97 functions/classes) — `main()` itself is now a lean 187 lines (split into 16 helpers), but the file is a module-extraction candidate.
+- **No batch / parallel conversion** — one model per invocation.
+- **No structured file logging** — console-only.
+- **SonarQube dashboard last scanned at v1.1.0** — needs a re-scan against current code before its "0 issues" claim can be trusted.
 
 ---
 
 ## Release History
 
-| Version | Focus | Status |
-|---------|-------|--------|
-| **v1.0.0** | MVP, single-file, smart defaults | ✅ Stable |
-| **v1.1.0** | 91% coverage, SonarQube, stability fixes | ✅ Released |
-| **v1.2** | Architecture refactor, logging | 📅 Next |
-| **v2.0** | Batch, integration tests, CI/CD | 📅 Planned |
+| Version | Date | Focus | Status |
+|---|---|---|---|
+| **v1.0.0** | 2026-05-30 | MVP — single-file, smart defaults | ✅ |
+| **v1.1.0** | 2026-06-11 | 91 % coverage, SonarQube (28→4 issues), stability | ✅ |
+| **v1.2.0** | 2026-06-12 | Model management + HF hub (search/download/list/scan) + config persistence | ✅ |
+| **v1.3.0** | 2026-06-12 | Interactive menu system, guided workflows, presets, history | ✅ |
+| **v1.4.0** | 2026-07-06 | **Vendor gguf2mlx** (direct calls, no subprocess), requests-based download, auto-convert | ✅ |
 
 ---
 
-## Roadmap: v1.2 → v2.0
+## Forward Roadmap
 
-### **v1.2: Architecture Refactor & Logging** (Target: 1-2 weeks)
+The forward work is organized into **tracks** grounded in the technical research (quality-preserving conversion, M1–M5 optimization, validation). Full designs live in `plans/refactor-and-model-roadmap.md`; this section is the executive view. All items below are **not yet implemented** unless marked ✅.
 
-**Goal:** Reduce cognitive complexity; add structured logging; improve maintainability.
+### Track 1 — ConversionPlan layer & quality-preserving conversion *(highest leverage)*
+The central architectural addition: an explicit, architecture-aware plan that decides quantization and prevents the **double-quantization** problem (re-compressing already-K-quantized GGUF weights degrades quality).
 
-- [ ] **Refactor `main()` into sub-commands**
-  - Extract pipeline stages into `Pipeline` class with `run()` method
-  - Sub-command pattern: `convert`, `inspect`, `estimate`, `resume`
-  - Target: reduce `main()` complexity from 209 → <50
-  - **Test:** Existing 209 tests must still pass unchanged
+- `ConversionMode` enum: `preserve-source` (dequantize GGUF K-quant → FP16, no re-quant), `hf-quality` (target HF-equivalent FP16/8-bit), `speed` (max compression).
+- `ConversionPlan` dataclass + `build_conversion_plan(args, meta, hw)` planner (see plan §5).
+- **No-double-quant guard**: detect source scheme (e.g. `Q4_K_M`) and refuse/emwarn re-quantization to ≤ source bits unless `--allow-low-bits`.
+- **Bit-width guidance to encode** (research-backed): 8-bit ≈ 99–100 %, 4-bit ≈ 98–99 %, **2-bit = quality cliff**; 6-bit is the sweet spot for small coding models.
+- **CLI**: `--quality-mode {preserve-source,hf-quality,speed}`, `--allow-low-bits`.
 
-- [ ] **Refactor `read_gguf_metadata()` complexity (50 → <15)**
-  - Extract arch-specific metadata readers into dispatch table
-  - Separate SSM detection, MTP detection, quality classification
-  - **Test:** Existing mocked tests cover all paths
+### Track 2 — Architecture expansion (the 82-arch gap)
+Broaden `SUPPORTED_MLX_ARCHITECTURES` and add arch-specific rules.
 
-- [ ] **Refactor `display_metadata()` complexity (18 → <15)**
-  - Extract panel builders for each metadata section
-  - **Test:** Existing display tests cover all paths
+- **P1**: Qwen3, Qwen3.5, Qwen3-AgentWorld, Gemma4 (MoE), Llama4, DeepSeek-V3/V3.2, Mistral3, LFM2.
+- **Qwen strategy** (plan §3.2/§5.3): `qwen3moe` expert routing, avoid ≤3-bit defaults (bump to 4-bit + warn), first-class MLX targets.
+- **Gemma3/4 MoE**: default to FP16-only in quality modes (quant needs arch-specific handling).
+- Per-arch dispatch table replacing the current `read_gguf_metadata()` complexity hotspot.
 
-- [ ] **Structured logging to file**
-  - Add `--log-file` for conversion history
-  - Add `--verbose` / `-v` flag
-  - JSON structured logging option
-  - Log: timestamp, step, status, command, duration
-  - **Test:** Parse logs, verify format
+### Track 3 — M1–M5 hardware optimization *(research: bandwidth-tiers)*
+Memory bandwidth is the strongest predictor of token throughput; encode it into the planner (plan §8).
 
-- [ ] **Fix remaining SonarQube issues**
-  - Resolve 4 Cognitive Complexity warnings (S3776)
-  - Target: 0 open issues on SonarQube dashboard
+- **Bandwidth tiers** from `detect_apple_silicon()`: low (~68 GB/s, M1 base) → mid (~150–200) → high (~300, Max/Pro) → ultra (~307–614, Ultra/M5 Max).
+- **bf16 vs fp16**: M1/M2 prefer `float16` intermediates (bf16 emulated → 40–70 % prefill penalty recovered); M3+ keep `bfloat16` natively when source is `MOSTLY_BF16`.
+- **Per-generation planner rules**: tier × model-size → default bits/group-size (e.g. ultra + 30–70B → 4-bit/group32; low + 1–7B → 4–6-bit/group128).
+- **Supervisor vs micro-agent** defaults (plan §8.4): high-RAM supervisors → FP16/8-bit; small helpers → 4–6-bit.
 
-**Estimated effort:** ~1-1.5 weeks
-**Impact:** Maintainable codebase; enables future batch features
+### Track 4 — Validation harness `--validate` *(regression guard)*
+Compare GGUF vs MLX outputs on a deterministic prompt suite to catch quality regressions from aggressive quant settings (plan §6).
 
----
+- `--validate`, `--validate-prompts PATH` (JSONL), `--validate-max-tokens` (default 128), `--validate-temp` (default 0.0, deterministic).
+- **Chip-aware prompt budget** (`qwen_validation_budget`) — fewer prompts on low-bandwidth/big-model combos.
+- **Runners**: `run_llama_cli(gguf)` vs `run_mlx_generate(model_dir)`.
+- **Metrics**: keyword hit-rate, symmetric token overlap, length ratio (truncation/verbosity).
+- CI-integrable; future `--validate-perplexity`.
 
-### **v2.0: Batch & Integration Tests** (Target: 2-3 weeks)
+### Track 5 — AWQ calibration & per-tensor quantization *(stretch)*
+- `--calibrate-awq`: forward-pass calibration over representative prompts (Qwen code, Mistral long-context, Llama chat) → per-channel AWQ scales before final quant.
+- **Per-tensor quant**: keep `lm_head`/`output_projection` at 8-bit/FP16; AWQ `q/k/v_proj`; generic 4/6-bit for the rest.
+- Disabled in `speed`, opt-in for `hf-quality`.
 
-**Goal:** Production-grade reliability; enable bulk conversions.
+### Track 6 — Metadata propagation
+Write provenance into MLX output (`config.json` or `metadata.json`) for oMLX/LM Studio routing:
+```json
+{ "gguf_to_mlx": { "source_scheme": "Q4_K_M", "source_bits": 4.5,
+  "target_bits": 8, "mode": "hf-quality", "calibrated": true,
+  "arch": "qwen3", "hf_origin": "Qwen/Qwen3-8B-Instruct" } }
+```
 
-- [ ] **Integration test suite with real GGUF models**
-  - Download small test models (Phi-2 2.7B, Gemma2-2B, Llama3.2-1B)
-  - E2E tests: convert → verify output → load in mlx_lm
-  - Test matrix: 5-6 architectures × 2-3 quantization levels
-  - Target: push coverage from 91% → 95%+
-  - **Test:** 15-20 new e2e tests (~5-10 min runtime)
+### Track 7 — Codebase refactor & module extraction
+`convert.py` → `gguf_to_mlx/` package (plan Parts 1–2): extract `plan.py`, `arch/`, `validate.py`, `quant.py`, `cli.py`. Recover coverage to 90 %+ and re-enable `mypy --strict`.
 
-- [ ] **Batch conversion**
-  - Add `--batch-dir` to scan for all `.gguf` files
-  - Add `--batch-list` to read paths from text file
-  - Add `--parallel N` for concurrent conversions
-  - Resource checks: disk, memory per task
-  - **Test:** e2e with 5+ models, verify all succeed
+### Track 8 — Batch, CI/CD, integration tests
+`--batch-dir`, `--batch-list`, `--parallel N`; GitHub Actions on macOS M-series runners (mypy, pytest --cov, sonar-scanner); E2E suite with small real GGUF models (Phi-2, Gemma2-2B, Llama3.2-1B) across 5–6 archs × 2–3 quants.
 
-- [ ] **Post-conversion validation hardening**
-  - Verify tokenizer.json loads in transformers
-  - Verify config.json matches mlx_lm schema
-  - Check safetensors file integrity (headers, tensor counts)
-  - Optional: single inference pass to verify model loads
-  - **Test:** Unit tests for validation rules
-
-- [ ] **CI/CD Pipeline**
-  - GitHub Actions on macOS M-series runner
-  - Run: mypy --strict, pytest --cov, sonar-scanner
-  - Quality gate: 90%+ coverage, 0 type errors
-  - **Test:** CI config validated
-
-- [ ] **Documentation**
-  - Add TROUBLESHOOTING.md for common errors
-  - Add ADVANCED.md for power users (custom params, batch, logging)
-  - Expand README with examples and architecture table
-
-**Estimated effort:** ~2-2.5 weeks
-**Impact:** Production-ready; catch regressions automatically
+> **Strategic note (research §1.1):** for models with canonical HF repos, `mlx_lm.convert --hf-path` (HF→MLX direct) remains the *primary* quality path; GGUF→MLX is the pragmatic fallback when only a GGUF is available. The roadmap invests in making the fallback fidelity match the primary.
 
 ---
 
-### **v2.1+: Premium Features** (Optional, lower priority)
+## Phased Schedule (from plan Part 4)
 
-- [ ] **Performance benchmarking**
-  - Add `--benchmark` flag
-  - Run inference on test dataset (GSM8K or MMLU)
-  - Measure: tokens/sec, memory peak, quality score
-  - **Estimated effort:** 1-2 weeks
-
-- [ ] **Model metadata enrichment**
-  - Scrape HuggingFace for recommended quantization
-  - Display recommendations pre-conversion
-  - **Estimated effort:** ~1 week
-
-- [ ] **Advanced features**
-  - Shell completion (bash/zsh/fish)
-  - Config file support (`.gguf-to-mlx.toml`)
-  - Non-local models (HuggingFace URLs, download + convert)
-  - Version auto-update checks
-  - **Estimated effort:** 2-3 weeks total
+| Phase | Window | Scope |
+|---|---|---|
+| **0 — Package shell** | Wk 1a | Extract `gguf_to_mlx/` skeleton, move-only refactor, tests green |
+| **1 — Foundation** | Wk 1b–2 | ConversionPlan (T1) + critical model gaps: Qwen3/3.5, Gemma4 (T2) |
+| **2 — Expansion** | Wk 3–4 | P1 architectures (T2), per-arch dispatch |
+| **3 — Quality & validation** | Wk 5–6 | M1–M5 tiers (T3), `--validate` (T4), bf16/fp16 handling |
+| **4 — Polish** | Wk 7–8 | AWQ/per-tensor (T5), metadata (T6), coverage → 90 %+, `mypy --strict` |
 
 ---
 
-## Success Metrics (Updated)
+## Success Metrics
 
-| Metric | v1.0 Target | v1.1 Actual | v2.0 Target |
-|--------|-------------|-------------|-------------|
-| **Test coverage** | 40+ unit tests | 209 tests, 91.6% | 230+ tests, 95%+ |
-| **Type safety** | mypy clean | ✅ mypy --strict | ✅ mypy --strict |
-| **SonarQube** | — | 0 bugs, 0 vulns | 0 issues total |
-| **Unsupported arch** | Pre-flight check | ✅ Done + known issues DB | Same |
-| **Error recovery** | Resume + cleanup | ✅ Done | Same |
-| **User customization** | `--group-size`, `--mode` | ✅ Done + `--dtype`, `--predicate` | Same |
-| **Batch support** | `--batch-dir`, `--parallel` | — | ✅ Target |
-| **CI/CD** | GitHub Actions | — | ✅ Target |
-| **Documentation** | ROADMAP | ✅ + SonarQube | TROUBLESHOOTING, ADVANCED |
+| Metric | v1.1 (prior) | v1.4 (now) | Target |
+|---|---|---|---|
+| Tests | 209 | **326** | 380+ |
+| Coverage (`convert.py`) | 91.6 % | **~78 %** | 90 %+ |
+| `mypy` | "strict clean" (stale) | `convert.py` clean (non-strict); 3 errs in vendored `core.py` | `--strict` clean end-to-end |
+| Supported archs | 18 | 21 (qwen3/3.5 *known-issue* only) | +12 P1 archs |
+| Quality guard | — | none | `--validate` + no-double-quant |
+| ruff | — | ✅ clean | ✅ clean |
+| Batch / CI | — | — | `--parallel`, GitHub Actions |
 
 ---
 
 ## Architecture Decision Log
 
-### Why single-file CLI? (Not modular)
-- ✅ Easy to install (copy 1 file, `pip install` deps)
-- ✅ No dependency management complexity
-- ✅ Fast startup, low overhead
-- ✅ Clear for users to understand flow
+### Why vendor `gguf2mlx` and call it directly? (v1.4.0) — *supersedes the old "subprocess for isolation" ADR*
+- ✅ No subprocess overhead; engine bugs fixed in-tree without waiting on upstream.
+- ✅ Direct `gguf2mlx.convert()` call; cleaner error interception than streamed stdout.
+- ⚠️ Trade-off: we now own `gguf2mlx/core.py` (3 mypy errors, vendored quirks) — acceptable, documented as known debt.
+- `mlx_lm` quantization (`mlx_lm.convert`) **still runs as a subprocess** (Popen at L930) — intentional: it's an external tool whose progress stream we parse.
 
-**Revisit when:** `main()` exceeds 300 lines after refactor → split into `cli/` package
+### Why single-file `convert.py`? (revisit condition updated)
+- ✅ Easy install (one file + `pip` deps); clear user-visible flow.
+- The original "revisit when main() > 300 lines" trigger **already fired and was handled** — `main()` was split to 187 lines (16 helpers, `cbb0416`).
+- **New revisit trigger:** total file exceeded 4,000 LOC → Track 7 package extraction now warranted, not just main() splitting.
 
-### Why subprocess for gguf2mlx + mlx_lm?
-- ✅ Isolation: one tool failure doesn't crash CLI
-- ✅ Progress tracking: stream stdout for % and fraction patterns
-- ✅ Simplicity: no direct Python dependency on internals
-- ⚠️ Trade-off: harder to intercept errors
+### Why did coverage drop to ~78 %?
+- v1.4.0 added vendored-engine wrapping, streaming download, auto-convert, and the full interactive menu faster than tests.
+- Not a "ceiling" — recoverable via the package refactor (Track 7) + integration tests (Track 8). The old "91 % ceiling because of real GGUF files" rationale is retired.
 
-**Alternative for v2.0:** Direct Python function calls with error wrapping
-
-### Why 91% coverage ceiling?
-- Remaining 9% requires real GGUF files (integration tests)
-- `main()` edge paths with interactive prompts (stdin blocking)
-- Defensive error handlers for corrupted safetensors
-- **v2.0 integration tests** will close this gap
+### Quality strategy: GGUF as transport, not truth
+- GGUF K-quants are mixed-precision; naive re-quantization to MLX 4-bit compounds error. The ConversionPlan `preserve-source`/`hf-quality` modes (Track 1) dequantize to FP16 first and recompute quantization, optionally AWQ-calibrated (Track 5).
 
 ---
 
 ## Acknowledgments
 
-Built on:
-- [gguf2mlx](https://github.com/barrontang/gguf2mlx) (core engine)
-- [mlx-lm](https://github.com/ml-explore/mlx-community) (quantization)
-- [Rich](https://rich.readthedocs.io/) (CLI UI)
-- [Apple MLX](https://github.com/ml-explore/mlx) (framework)
+Built on [gguf2mlx](https://github.com/barrontang/gguf2mlx) (vendored engine), [mlx-lm](https://github.com/ml-explore/mlx-community) (quantization), [Rich](https://rich.readthedocs.io/)), [Apple MLX](https://github.com/ml-explore/mlx). Forward tracks are grounded in technical research on Qwen GGUF→MLX conversion, M1–M5 bandwidth optimization, and AWQ-style calibration — detailed and sourced in [`plans/refactor-and-model-roadmap.md`](plans/refactor-and-model-roadmap.md) §"Sources & Research".
