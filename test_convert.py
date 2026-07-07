@@ -1,5 +1,6 @@
 """Tests for gguf-to-mlx converter."""
 
+import json
 import sys
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -651,7 +652,7 @@ class TestFixGemma4TensorNames:
         fix_gemma4_tensor_names(tmp_path)  # Should not raise
 
 
-class TestFormatHelpers:
+class TestFormatHelpersEdgeCases:
     """Extended tests for format helpers."""
 
     def test_format_size_zero(self):
@@ -680,9 +681,6 @@ class TestDisplayHelpers:
 
     def test_banner(self, capsys):
         from convert import banner
-        import io
-        from rich.console import Console
-        from convert import console as global_console
         # Just verify it doesn't crash
         banner()
 
@@ -1125,63 +1123,92 @@ class TestPreflightExtended:
 
 
 class TestDownloadFromHuggingface:
-    """Tests for HuggingFace download function."""
+    """Tests for HuggingFace download function (updated for requests-based download)."""
 
     def test_cached_file_returned(self, tmp_path):
         from convert import download_from_huggingface
-        cache = tmp_path / "cache"
+        cache = tmp_path / "downloads"
         cache.mkdir()
-        cached = cache / "org_model_Q4_K_M.gguf"
+        safe_name = "org--model__file.gguf"
+        cached = cache / safe_name
         cached.write_bytes(b"GGUF" + b"\x00" * 100)
-        result = download_from_huggingface("org/model", "Q4_K_M.gguf", cache_dir=cache)
+        result = download_from_huggingface("org/model", "file.gguf", cache_dir=cache, quiet=True)
         assert result == cached
 
-    def test_download_success(self, tmp_path):
+    def test_download_success_new(self, tmp_path):
         from convert import download_from_huggingface
-        cache = tmp_path / "cache"
+        cache = tmp_path / "downloads"
         cache.mkdir()
-        with patch("urllib.request.urlretrieve"):
-            result = download_from_huggingface("org/model", "model.gguf", cache_dir=cache)
-            assert isinstance(result, Path)
 
-    def test_download_failure_exits(self, tmp_path):
-        from convert import download_from_huggingface
-        cache = tmp_path / "cache"
-        cache.mkdir()
-        with patch("urllib.request.urlretrieve", side_effect=Exception("network error")):
-            with pytest.raises(SystemExit):
-                download_from_huggingface("org/model", "model.gguf", cache_dir=cache)
+        mock_resp = MagicMock()
+        mock_resp.headers = {"content-length": "100"}
+        mock_resp.iter_content = MagicMock(return_value=[b"data"])
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
 
-    def test_no_urllib_exits(self, tmp_path):
+        with patch("requests.get", return_value=mock_resp):
+            result = download_from_huggingface("org/model", "model.gguf", cache_dir=cache, quiet=True)
+            assert result is not None
+
+    def test_download_no_requests_exits(self, tmp_path):
         import convert
-        orig = convert.HAS_URLLIB
-        convert.HAS_URLLIB = False
+        orig = convert.HAS_REQUESTS
+        convert.HAS_REQUESTS = False
         try:
-            with pytest.raises(SystemExit):
-                convert.download_from_huggingface("org/model", "model.gguf")
+            result = convert.download_from_huggingface("org/model", "model.gguf", cache_dir=tmp_path, quiet=True)
+            assert result is None
         finally:
-            convert.HAS_URLLIB = orig
+            convert.HAS_REQUESTS = orig
+
+    def test_cached_with_auto_convert(self, tmp_path):
+        from convert import download_from_huggingface
+        cache = tmp_path / "downloads"
+        cache.mkdir()
+        safe_name = "org--model__model.gguf"
+        cached = cache / safe_name
+        cached.write_bytes(b"GGUF" + b"\x00" * 100)
+        with patch("convert._auto_convert_downloaded") as mock_ac:
+            result = download_from_huggingface("org/model", "model.gguf", cache_dir=cache, auto_convert=True, output_dir=tmp_path / "out", quiet=True)
+            assert result == cached
+            mock_ac.assert_called_once()
 
 
 class TestHandleRegistryUrlExtended:
-    """Extended tests for registry URL handling."""
+    """Extended tests for registry URL handling (updated signature)."""
 
     def test_hf_with_three_parts(self):
         from convert import handle_registry_url
         with patch("convert.download_from_huggingface", return_value=Path("/cached/model.gguf")):
-            result = handle_registry_url("hf:org/subdir/model.gguf")
-            assert result == Path("/cached/model.gguf")
+            with patch("convert.get_hf_token", return_value=None):
+                result = handle_registry_url("hf:org/subdir/model.gguf", quiet=True)
+                assert result == Path("/cached/model.gguf")
 
     def test_hf_with_two_parts(self):
         from convert import handle_registry_url
         with patch("convert.download_from_huggingface", return_value=Path("/cached/model.gguf")):
-            result = handle_registry_url("hf:org/model")
-            assert result == Path("/cached/model.gguf")
+            with patch("convert.get_hf_token", return_value=None):
+                result = handle_registry_url("hf:org/model", quiet=True)
+                assert result == Path("/cached/model.gguf")
 
     def test_hf_invalid_single_part(self):
         from convert import handle_registry_url
         with pytest.raises(SystemExit):
-            handle_registry_url("hf:justonepart")
+            handle_registry_url("hf:justonepart", quiet=True)
+
+    def test_local_path_unchanged(self):
+        from convert import handle_registry_url
+        result = handle_registry_url("/home/user/model.gguf")
+        assert result == Path("/home/user/model.gguf")
+
+    def test_hf_download_with_auto_convert(self):
+        from convert import handle_registry_url
+        with patch("convert.download_from_huggingface", return_value=Path("/cached/model.gguf")) as mock_dl:
+            with patch("convert.get_hf_token", return_value=None):
+                result = handle_registry_url("hf:org/model", auto_convert=True, delete_gguf=True, quiet=True)
+                assert result == Path("/cached/model.gguf")
+                assert mock_dl.call_args[1]["auto_convert"] is True
+                assert mock_dl.call_args[1]["delete_gguf"] is True
 
 
 class TestRunWithProgressExtended:
@@ -1397,15 +1424,17 @@ class TestMainEstimateMode:
 
 
 class TestMainNoInput:
-    """Test main() with no input file."""
+    """Test main() with no input file - should launch interactive menu."""
 
-    def test_guided_mode_requires_deps(self):
+    def test_no_args_launches_menu(self):
         with patch("sys.argv", ["convert.py"]):
-            with patch("convert.check_dependencies", return_value={"gguf2mlx": None, "mlx_lm": None, "mlx": None, "gguf_py": None}):
-                with patch("convert.ensure_deps", side_effect=SystemExit(1)):
-                    with pytest.raises(SystemExit):
-                        from convert import main
-                        main()
+            with patch("convert.run_interactive_menu") as mock_menu:
+                try:
+                    from convert import main
+                    main()
+                except SystemExit:
+                    pass
+                mock_menu.assert_called_once()
 
 
 class TestMainPreflightFails:
@@ -1543,7 +1572,7 @@ class TestMainHighBandwidth:
             with patch("convert.check_dependencies", return_value={"gguf2mlx": "?", "mlx_lm": "?", "mlx": "?", "gguf_py": "?"}):
                 with patch("convert._has_gguf_py", return_value=False):
                     with patch("convert.ensure_deps"):
-                        with patch("convert.run_with_progress", return_value=(True, "")) as mock_run:
+                        with patch("convert.run_with_progress", return_value=(True, "")):
                             with patch("shutil.rmtree"):
                                 with patch("convert.validate_output", return_value=True):
                                     from convert import main
@@ -1788,7 +1817,6 @@ class TestMainNoQuantize:
         gguf = tmp_path / "model.gguf"
         gguf.write_bytes(b"GGUF" + b"\x00" * (4 * 1024 * 1024))
         out = tmp_path / "output"
-        intermediate = tmp_path / "output_intermediate"
 
         call_count = [0]
         def fake_run(cmd, description, progress=None, quiet=False):
@@ -2104,7 +2132,7 @@ class TestMainAutoCleanupOnFailure:
                     with patch("convert.ensure_deps"):
                         with patch("convert.read_gguf_metadata", return_value=None):
                             with patch("convert.run_with_progress", return_value=(False, "error")):
-                                with patch("shutil.rmtree") as mock_rmtree:
+                                with patch("shutil.rmtree"):
                                     from convert import main
                                     try:
                                         main()
@@ -2289,7 +2317,6 @@ class TestMainStep1FailureKnownIssue:
         gguf = tmp_path / "model.gguf"
         gguf.write_bytes(b"GGUF" + b"\x00" * (4 * 1024 * 1024))
         out = tmp_path / "output"
-        intermediate = tmp_path / "output_intermediate"
 
         with patch("sys.argv", ["convert.py", str(gguf), str(out), "--force", "--quiet"]):
             with patch("convert.check_dependencies", return_value={"gguf2mlx": "?", "mlx_lm": "?", "mlx": "?", "gguf_py": "?"}):
@@ -2468,20 +2495,14 @@ class TestMainDiskSpaceCheck:
 
 
 class TestMainGuidedMode:
-    """Cover guided mode (no input file, interactive)."""
+    """Cover interactive menu mode (no input file, launches menu)."""
 
-    def test_guided_no_input(self, tmp_path):
+    def test_no_input_launches_menu(self, tmp_path):
         with patch("sys.argv", ["convert.py"]):
-            with patch("convert.check_dependencies", return_value={"gguf2mlx": "?", "mlx_lm": "?", "mlx": "?", "gguf_py": "?"}):
-                with patch("convert.ensure_deps"):
-                    with patch("convert.get_gguf_path", return_value=tmp_path / "model.gguf"):
-                        with patch("convert.get_output_dir", return_value=tmp_path / "out"):
-                            # Will fail on file not existing
-                            from convert import main
-                            try:
-                                main()
-                            except SystemExit:
-                                pass
+            with patch("convert.run_interactive_menu", side_effect=SystemExit(0)):
+                with pytest.raises(SystemExit):
+                    from convert import main
+                    main()
 
 
 class TestMainIntermediateExistsConfirm:
@@ -2558,3 +2579,1154 @@ class TestMainIntermediateExistsConfirm:
                                                     main()
                                                 except SystemExit:
                                                     pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# New Feature Tests — Config, Scanning, HF, Menu, History (v1.3+)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestConfigManagement:
+    """Tests for configuration management system."""
+
+    def test_load_config_empty(self, tmp_path):
+        from convert import load_config
+        with patch("convert.CONFIG_PATH", tmp_path / "nonexistent.json"):
+            config = load_config()
+            assert config == {}
+
+    def test_load_config_valid(self, tmp_path):
+        from convert import load_config
+        cfg = tmp_path / "config.json"
+        cfg.write_text('{"models_dir": "/test"}')
+        with patch("convert.CONFIG_PATH", cfg):
+            config = load_config()
+            assert config["models_dir"] == "/test"
+
+    def test_load_config_corrupted(self, tmp_path):
+        from convert import load_config
+        cfg = tmp_path / "config.json"
+        cfg.write_text("not json")
+        with patch("convert.CONFIG_PATH", cfg):
+            config = load_config()
+            assert config == {}
+
+    def test_save_config(self, tmp_path):
+        from convert import save_config
+        cfg = tmp_path / "config.json"
+        with patch("convert.CONFIG_PATH", cfg):
+            with patch("convert.CONFIG_DIR", tmp_path):
+                save_config({"key": "val"})
+        assert cfg.exists()
+        import json
+        assert json.loads(cfg.read_text()) == {"key": "val"}
+
+    def test_get_models_dir_custom(self, tmp_path):
+        from convert import get_models_dir
+        cfg = tmp_path / "config.json"
+        cfg.write_text('{"models_dir": "' + str(tmp_path / "models") + '"}')
+        (tmp_path / "models").mkdir()
+        with patch("convert.CONFIG_PATH", cfg):
+            result = get_models_dir()
+            assert result == tmp_path / "models"
+
+    def test_get_models_dir_not_exists_fallback(self, tmp_path):
+        from convert import get_models_dir
+        cfg = tmp_path / "config.json"
+        cfg.write_text('{"models_dir": "' + str(tmp_path / "gone") + '"}')
+        with patch("convert.CONFIG_PATH", cfg):
+            result = get_models_dir()
+            assert result == Path.home() / "Models"
+
+    def test_set_models_dir(self, tmp_path):
+        from convert import set_models_dir
+        cfg = tmp_path / "config.json"
+        with patch("convert.CONFIG_PATH", cfg):
+            with patch("convert.CONFIG_DIR", tmp_path):
+                set_models_dir(str(tmp_path / "custom_models"))
+        assert str(tmp_path / "custom_models") in cfg.read_text()
+
+    def test_get_hf_token_from_config(self, tmp_path):
+        from convert import get_hf_token_from_config
+        cfg = tmp_path / "config.json"
+        cfg.write_text('{"hf_token": "hf_test123"}')
+        with patch("convert.CONFIG_PATH", cfg):
+            token = get_hf_token_from_config()
+            assert token == "hf_test123"
+
+    def test_save_hf_token(self, tmp_path):
+        from convert import save_hf_token
+        cfg = tmp_path / "config.json"
+        with patch("convert.CONFIG_PATH", cfg):
+            with patch("convert.CONFIG_DIR", tmp_path):
+                save_hf_token("new_token")
+        import json
+        assert json.loads(cfg.read_text())["hf_token"] == "new_token"
+
+
+class TestFormatHelpers:
+    """Tests for format utilities."""
+
+    def test_format_speed_gb(self):
+        from convert import format_speed
+        assert "GB/s" in format_speed(1_500_000_000)
+        assert "1.50" in format_speed(1_500_000_000)
+
+    def test_format_speed_mb(self):
+        from convert import format_speed
+        assert "MB/s" in format_speed(5_000_000)
+
+    def test_format_speed_kb(self):
+        from convert import format_speed
+        assert "KB/s" in format_speed(5_000)
+
+    def test_format_speed_bytes(self):
+        from convert import format_speed
+        assert "B/s" in format_speed(500)
+
+    def test_format_size_gb(self):
+        from convert import format_size
+        assert "GB" in format_size(1e9)
+
+    def test_format_size_mb(self):
+        from convert import format_size
+        assert "MB" in format_size(1e6)
+
+    def test_format_time_seconds(self):
+        from convert import format_time
+        assert "s" in format_time(30)
+
+    def test_format_time_minutes(self):
+        from convert import format_time
+        result = format_time(90)
+        assert "m" in result
+
+    def test_format_time_hours(self):
+        from convert import format_time
+        result = format_time(4000)
+        assert "h" in result
+
+
+class TestShortenName:
+    """Tests for model name shortening."""
+
+    def test_short_name_fits(self):
+        from convert import _shorten_name
+        result = _shorten_name("llama-3.2-3b", max_len=20)
+        assert result == "llama-3.2-3b"
+
+    def test_short_name_has_slash(self):
+        from convert import _shorten_name
+        result = _shorten_name("community/very-long-model-name-that-exceeds-limit/final", max_len=30)
+        assert "..." in result
+        assert "final" in result
+
+    def test_short_name_no_slash(self):
+        from convert import _shorten_name
+        result = _shorten_name("a" * 60, max_len=20)
+        assert "..." in result
+        assert len(result) <= 20
+
+
+class TestFormatSourceTag:
+    """Tests for source tag formatting."""
+
+    def test_omlx_tag(self):
+        from convert import _format_source_tag
+        tag = _format_source_tag("omlx")
+        assert "omlx" in tag
+
+    def test_lmstudio_tag(self):
+        from convert import _format_source_tag
+        tag = _format_source_tag("lmstudio")
+        assert "lmstudio" in tag
+
+    def test_custom_tag(self):
+        from convert import _format_source_tag
+        tag = _format_source_tag("custom")
+        assert "custom" in tag
+
+    def test_unknown_tag(self):
+        from convert import _format_source_tag
+        result = _format_source_tag("unknown")
+        assert result == "unknown"
+
+
+class TestFoundModel:
+    """Tests for FoundModel dataclass."""
+
+    def test_creation(self):
+        from convert import FoundModel
+        p = Path("/test/model.gguf")
+        fm = FoundModel(path=p, format="gguf", source="custom", size_gb=5.0, name="model")
+        assert fm.path == p
+        assert fm.format == "gguf"
+        assert fm.source == "custom"
+        assert fm.size_gb == 5.0
+
+    def test_default_metadata(self):
+        from convert import FoundModel
+        fm = FoundModel(path=Path("/x"), format="mlx", source="omlx", size_gb=1.0, name="x")
+        assert fm.metadata is None
+
+
+class TestScanForModels:
+    """Tests for model scanning."""
+
+    def test_scan_empty_dir(self, tmp_path):
+        from convert import scan_for_models
+        models = scan_for_models(custom_dir=tmp_path)
+        assert models == []
+
+    def test_scan_finds_gguf(self, tmp_path):
+        from convert import scan_for_models
+        gguf = tmp_path / "model.gguf"
+        gguf.write_bytes(b"GGUF" + b"\x00" * (200 * 1024 * 1024))
+        models = scan_for_models(custom_dir=tmp_path)
+        assert len(models) >= 1
+        assert models[0].format == "gguf"
+
+    def test_scan_skips_small_files(self, tmp_path):
+        from convert import scan_for_models
+        small = tmp_path / "small.gguf"
+        small.write_bytes(b"GGUF" + b"\x00" * 10)
+        models = scan_for_models(custom_dir=tmp_path)
+        assert len(models) == 0
+
+    def test_scan_omlx_flag(self, tmp_path):
+        from convert import SCAN_DIRS, scan_for_models
+        with patch.dict(SCAN_DIRS, {"omlx": tmp_path}, clear=True):
+            gguf = tmp_path / "test.gguf"
+            gguf.write_bytes(b"GGUF" + b"\x00" * (200 * 1024 * 1024))
+            models = scan_for_models(scan_omlx=True)
+            assert any(m.source == "omlx" for m in models)
+
+    def test_scan_lmstudio_flag(self, tmp_path):
+        from convert import SCAN_DIRS, scan_for_models
+        with patch.dict(SCAN_DIRS, {"lmstudio": tmp_path}, clear=True):
+            gguf = tmp_path / "model.gguf"
+            gguf.write_bytes(b"GGUF" + b"\x00" * (200 * 1024 * 1024))
+            models = scan_for_models(scan_lmstudio=True)
+            assert any(m.source == "lmstudio" for m in models)
+
+    def test_scan_all_flag(self):
+        from convert import scan_for_models
+        models = scan_for_models(scan_all=True)
+        assert isinstance(models, list)
+
+    def test_scan_sorted_by_size(self, tmp_path):
+        from convert import scan_for_models
+        big = tmp_path / "big.gguf"
+        big.write_bytes(b"GGUF" + b"\x00" * (400 * 1024 * 1024))
+        small = tmp_path / "small.gguf"
+        small.write_bytes(b"GGUF" + b"\x00" * (200 * 1024 * 1024))
+        models = scan_for_models(custom_dir=tmp_path)
+        assert models[0].size_gb > models[-1].size_gb
+
+
+class TestHistoryTracking:
+    """Tests for conversion history tracking."""
+
+    def test_load_history_empty(self, tmp_path):
+        from convert import _load_history
+        with patch("convert.HISTORY_PATH", tmp_path / "nonexistent.json"):
+            history = _load_history()
+            assert history == []
+
+    def test_save_and_load(self, tmp_path):
+        from convert import _save_history_entry, _load_history
+        hist_file = tmp_path / "history.json"
+        with patch("convert.HISTORY_PATH", hist_file):
+            with patch("convert.CONFIG_DIR", tmp_path):
+                _save_history_entry({"action": "convert", "input": "model.gguf"})
+            history = _load_history()
+            assert len(history) == 1
+            assert history[0]["action"] == "convert"
+
+    def test_history_max_10(self, tmp_path):
+        from convert import _save_history_entry, _load_history
+        hist_file = tmp_path / "history.json"
+        with patch("convert.HISTORY_PATH", hist_file):
+            with patch("convert.CONFIG_DIR", tmp_path):
+                for i in range(15):
+                    _save_history_entry({"action": f"convert_{i}"})
+            history = _load_history()
+            assert len(history) <= 10
+            assert history[-1]["action"] == "convert_14"
+
+
+class TestMenuBuilders:
+    """Tests for menu helper functions."""
+
+    def test_make_menu_args_defaults(self):
+        from convert import _make_menu_args
+        args = _make_menu_args()
+        assert args.force is False
+        assert args.quiet is False
+        assert args.input is None
+
+    def test_make_menu_args_overrides(self):
+        from convert import _make_menu_args
+        args = _make_menu_args(force=True, bits=8)
+        assert args.force is True
+        assert args.bits == 8
+
+    def test_has_cli_args_input(self):
+        from convert import _has_cli_args
+        import argparse
+        args = argparse.Namespace(input="model.gguf", output=None, scan=False, hf_search=None)
+        assert _has_cli_args(args) is True
+
+    def test_has_cli_args_scan(self):
+        from convert import _has_cli_args
+        import argparse
+        args = argparse.Namespace(input=None, output=None, scan=True, hf_search=None)
+        assert _has_cli_args(args) is True
+
+    def test_has_cli_args_none(self):
+        from convert import _has_cli_args
+        import argparse
+        args = argparse.Namespace(input=None, output=None, scan=False, hf_search=None, set_models_dir=None)
+        assert _has_cli_args(args) is False
+
+    def test_has_cli_args_with_quiet(self):
+        from convert import _has_cli_args
+        import argparse
+        args = argparse.Namespace(input=None, output=None, scan=False, hf_search=None, quiet=True)
+        assert _has_cli_args(args) is False
+
+    def test_get_hardware_recommendation_max(self):
+        from convert import _get_hardware_recommendation
+        with patch("convert.detect_apple_silicon", return_value={
+            "is_apple_silicon": True, "ram_gb": 69, "chip_tier": "max"
+        }):
+            result = _get_hardware_recommendation()
+            assert "70B+" in result
+
+    def test_get_hardware_recommendation_med(self):
+        from convert import _get_hardware_recommendation
+        with patch("convert.detect_apple_silicon", return_value={
+            "is_apple_silicon": True, "ram_gb": 24, "chip_tier": "base"
+        }):
+            result = _get_hardware_recommendation()
+            assert "7B" in result or "13B" in result
+
+    def test_get_hardware_recommendation_low(self):
+        from convert import _get_hardware_recommendation
+        with patch("convert.detect_apple_silicon", return_value={
+            "is_apple_silicon": True, "ram_gb": 8, "chip_tier": "base"
+        }):
+            result = _get_hardware_recommendation()
+            assert "1B" in result
+
+
+class TestDependencyWizard:
+    """Tests for dependency check system."""
+
+    def test_check_single_dep_present(self):
+        from convert import _check_single_dep
+        assert _check_single_dep("os") is True
+
+    def test_check_single_dep_missing(self):
+        from convert import _check_single_dep
+        assert _check_single_dep("nonexistent_module_xyz") is False
+
+
+class TestHFToken:
+    """Tests for HF token resolution."""
+
+    def test_get_hf_token_from_env(self):
+        from convert import get_hf_token
+        with patch.dict("os.environ", {"HF_TOKEN": "env_token"}):
+            token = get_hf_token(quiet=True)
+            assert token == "env_token"
+
+    def test_get_hf_token_from_config(self, tmp_path):
+        from convert import get_hf_token
+        cfg = tmp_path / "config.json"
+        cfg.write_text('{"hf_token": "cfg_token"}')
+        with patch.dict("os.environ", {}, clear=True):
+            with patch("convert.CONFIG_PATH", cfg):
+                token = get_hf_token(quiet=True)
+                assert token == "cfg_token"
+
+    def test_get_hf_token_quiet_none(self):
+        from convert import get_hf_token
+        with patch.dict("os.environ", {}, clear=True):
+            with patch("convert.get_hf_token_from_config", return_value=None):
+                token = get_hf_token(quiet=True)
+                assert token is None
+
+
+class TestHfSearch:
+    """Tests for HuggingFace search."""
+
+    def test_hf_search_no_requests(self):
+        from convert import hf_search
+        import convert
+        orig = convert.HAS_REQUESTS
+        convert.HAS_REQUESTS = False
+        try:
+            with pytest.raises(SystemExit):
+                hf_search("test")
+        finally:
+            convert.HAS_REQUESTS = orig
+
+    def test_hf_search_success(self):
+        from convert import hf_search
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = [
+            {"id": "org/model-a", "downloads": 1000, "likes": 50, "pipeline_tag": "text-generation", "private": False},
+            {"id": "org/model-b", "downloads": 500, "likes": 20, "pipeline_tag": "", "private": False},
+        ]
+        mock_resp.raise_for_status = MagicMock()
+        with patch("requests.get", return_value=mock_resp):
+            results = hf_search("test", token="tok")
+            assert len(results) == 2
+            assert results[0]["id"] == "org/model-a"
+
+    def test_hf_search_empty(self):
+        from convert import hf_search
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = []
+        mock_resp.raise_for_status = MagicMock()
+        with patch("requests.get", return_value=mock_resp):
+            results = hf_search("nonexistent_model_xyz")
+            assert results == []
+
+
+class TestHfListFiles:
+    """Tests for HuggingFace file listing."""
+
+    def test_hf_list_no_requests(self):
+        from convert import hf_list_files
+        import convert
+        orig = convert.HAS_REQUESTS
+        convert.HAS_REQUESTS = False
+        try:
+            with pytest.raises(SystemExit):
+                hf_list_files("test/repo")
+        finally:
+            convert.HAS_REQUESTS = orig
+
+    def test_hf_list_success(self):
+        from convert import hf_list_files
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "siblings": [
+                {"rfilename": "model.gguf", "size": 5_000_000_000},
+                {"rfilename": "config.json", "size": 100},
+            ]
+        }
+        mock_resp.raise_for_status = MagicMock()
+        with patch("requests.get", return_value=mock_resp):
+            files = hf_list_files("org/model")
+            assert len(files) == 2
+            assert files[0]["path"] == "model.gguf"
+
+    def test_hf_list_empty_repo(self):
+        from convert import hf_list_files
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"siblings": []}
+        mock_resp.raise_for_status = MagicMock()
+        with patch("requests.get", return_value=mock_resp):
+            files = hf_list_files("empty/repo")
+            assert files == []
+
+
+class TestDownloadWithProgress:
+    """Tests for download_with_progress function."""
+
+    def test_download_no_requests(self, tmp_path):
+        from convert import download_with_progress
+        import convert
+        orig = convert.HAS_REQUESTS
+        convert.HAS_REQUESTS = False
+        try:
+            result = download_with_progress("http://test", tmp_path / "out", quiet=True)
+            assert result is False
+        finally:
+            convert.HAS_REQUESTS = orig
+
+    def test_download_success(self, tmp_path):
+        from convert import download_with_progress
+        dest = tmp_path / "downloaded.bin"
+        mock_resp = MagicMock()
+        mock_resp.headers = {"content-length": "100"}
+        mock_resp.iter_content = MagicMock(return_value=[b"data"])
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        with patch("requests.get", return_value=mock_resp):
+            result = download_with_progress("http://test", dest, repo_id="test/model", quiet=True)
+            assert result is True
+            assert dest.exists()
+
+    def test_download_failure(self, tmp_path):
+        from convert import download_with_progress
+        import requests as req
+        dest = tmp_path / "failed.bin"
+        with patch("requests.get", side_effect=req.RequestException("network error")):
+            result = download_with_progress("http://test", dest, quiet=True)
+            assert result is False
+
+
+class TestInteractiveMenuMocks:
+    """Tests for interactive menu functions with mocked UI."""
+
+    def test_menu_banner_output(self):
+        from convert import _menu_banner
+        with patch("convert.detect_apple_silicon", return_value={
+            "is_apple_silicon": True, "chip_name": "Apple M3", "ram_gb": 16
+        }):
+            with patch("convert._load_history", return_value=[]):
+                with patch("convert.console.print") as mock_print:
+                    _menu_banner()
+                assert mock_print.called
+
+    def test_menu_header_output(self):
+        from convert import _menu_header
+        with patch("convert.console.print") as mock_print:
+            _menu_header("Test Section", "test")
+        assert mock_print.called
+
+    def test_pause_after_with_input(self):
+        from convert import _pause_after
+        with patch("convert.Prompt.ask", return_value="") as mock_ask:
+            _pause_after()
+        mock_ask.assert_called_once()
+
+    def test_list_output_files(self, tmp_path):
+        from convert import _list_output_files
+        f1 = tmp_path / "model.safetensors"
+        f1.write_bytes(b"\x00" * 1000)
+        f2 = tmp_path / "config.json"
+        f2.write_text("{}")
+        with patch("convert.console.print") as mock_print:
+            _list_output_files(tmp_path)
+        assert mock_print.called
+
+    def test_run_interactive_menu_exit(self):
+        from convert import run_interactive_menu
+        with patch("convert._menu_banner"):
+            with patch("convert._get_hardware_recommendation", return_value="test"):
+                with patch("convert.Prompt.ask", side_effect=["0"]):
+                    with pytest.raises(SystemExit):
+                        run_interactive_menu()
+
+    def test_run_interactive_menu_settings(self):
+        from convert import run_interactive_menu
+        with patch("convert._menu_banner"):
+            with patch("convert._get_hardware_recommendation", return_value="test"):
+                with patch("convert.Prompt.ask", side_effect=["6", "0"]):
+                    with patch("convert._show_settings_menu", side_effect=SystemExit(0)):
+                        with pytest.raises(SystemExit):
+                            run_interactive_menu()
+
+    def test_run_menu_handles_keyboard_interrupt(self):
+        from convert import run_interactive_menu
+        with patch("convert._menu_banner"):
+            with patch("convert._get_hardware_recommendation", return_value="test"):
+                with patch("convert.Prompt.ask", side_effect=KeyboardInterrupt):
+                    with pytest.raises(SystemExit):
+                        run_interactive_menu()
+
+
+class TestSettingsMenu:
+    """Tests for settings sub-menu."""
+
+    def test_settings_back_to_menu(self, tmp_path):
+        from convert import _show_settings_menu
+        cfg = tmp_path / "config.json"
+        cfg.write_text("{}")
+        hist = tmp_path / "history.json"
+        hist.write_text("[]")
+        with patch("convert.CONFIG_PATH", cfg):
+            with patch("convert.HISTORY_PATH", hist):
+                with patch("convert.Prompt.ask", return_value="5"):
+                    with patch("convert.console.print"):
+                        _show_settings_menu()
+
+    def test_settings_set_models_dir(self, tmp_path):
+        from convert import _show_settings_menu
+        cfg = tmp_path / "config.json"
+        cfg.write_text("{}")
+        hist = tmp_path / "history.json"
+        hist.write_text("[]")
+        with patch("convert.CONFIG_PATH", cfg):
+            with patch("convert.HISTORY_PATH", hist):
+                with patch("convert.Prompt.ask", side_effect=["1", str(tmp_path / "models"), "5"]):
+                    with patch("convert.CONFIG_DIR", tmp_path):
+                        with patch("convert.console.print"):
+                            _show_settings_menu()
+
+
+class TestGuidedConvert:
+    """Tests for guided convert workflow."""
+
+    def test_guided_convert_cancelled(self, tmp_path):
+        from convert import _show_guided_convert, _make_menu_args
+        gguf = tmp_path / "model.gguf"
+        gguf.write_bytes(b"GGUF" + b"\x00" * 100)
+        args = _make_menu_args(force=True)
+        with patch("convert.get_gguf_path", return_value=gguf):
+            with patch("convert.read_gguf_metadata", return_value={"architecture": "llama", "file_type": 2, "file_type_name": "Q4_K_M"}):
+                with patch("convert.Prompt.ask", side_effect=["1"]):
+                    with patch("convert.Confirm.ask", side_effect=[False, False]):
+                        with patch("convert._pause_after"):
+                            _show_guided_convert(args)
+
+    def test_guided_convert_quality_preset(self, tmp_path):
+        from convert import _show_guided_convert, _make_menu_args
+        gguf = tmp_path / "model.gguf"
+        gguf.write_bytes(b"GGUF" + b"\x00" * 100)
+        args = _make_menu_args(force=True)
+        with patch("convert.get_gguf_path", return_value=gguf):
+            with patch("convert.read_gguf_metadata", return_value={"architecture": "llama", "file_type": 5, "file_type_name": "Q8_0"}):
+                with patch("convert.Prompt.ask", side_effect=["2"]):
+                    with patch("convert.Confirm.ask", return_value=False):
+                        with patch("convert._pause_after"):
+                            _show_guided_convert(args)
+        assert args.preset == "quality"
+
+
+class TestGuidedScanConvert:
+    """Tests for guided scan & convert workflow."""
+
+    def test_guided_scan_custom_dir_not_found(self, tmp_path):
+        from convert import _show_guided_scan_convert, _make_menu_args
+        args = _make_menu_args(force=True)
+        with patch("convert.Prompt.ask", side_effect=["custom", str(tmp_path / "nonexistent")]):
+            with patch("convert._pause_after"):
+                _show_guided_scan_convert(args)
+
+    def test_guided_scan_all_empty(self):
+        from convert import _show_guided_scan_convert, _make_menu_args
+        args = _make_menu_args(force=True)
+        with patch("convert.Prompt.ask", side_effect=["all"]):
+            with patch("convert.scan_for_models", return_value=[]):
+                with patch("convert.display_scan_results", return_value=None):
+                    _show_guided_scan_convert(args)
+
+
+class TestGuidedInspect:
+    """Tests for guided inspect workflow."""
+
+    def test_inspect_file_not_found(self, tmp_path):
+        from convert import _show_guided_inspect
+        with patch("convert.get_gguf_path", return_value=tmp_path / "nonexistent.gguf"):
+            with patch("convert._pause_after"):
+                _show_guided_inspect()
+
+    def test_inspect_not_gguf(self, tmp_path):
+        from convert import _show_guided_inspect
+        not_gguf = tmp_path / "model.txt"
+        not_gguf.write_text("not a model")
+        with patch("convert.get_gguf_path", return_value=not_gguf):
+            with patch("convert._pause_after"):
+                _show_guided_inspect()
+
+    def test_inspect_no_gguf_py(self, tmp_path):
+        from convert import _show_guided_inspect
+        gguf = tmp_path / "model.gguf"
+        gguf.write_bytes(b"GGUF" + b"\x00" * 100)
+        with patch("convert.get_gguf_path", return_value=gguf):
+            with patch("convert._has_gguf_py", return_value=False):
+                with patch("convert._pause_after"):
+                    _show_guided_inspect()
+
+
+class TestGuidedHfDownload:
+    """Tests for guided HuggingFace download workflow."""
+
+    def test_guided_hf_empty_query(self):
+        from convert import _show_guided_hf_download
+        with patch("convert.get_hf_token", return_value=None):
+            with patch("convert.Prompt.ask", return_value=""):
+                _show_guided_hf_download(auto_convert=False)
+
+    def test_guided_hf_no_results(self):
+        from convert import _show_guided_hf_download
+        with patch("convert.get_hf_token", return_value=None):
+            with patch("convert.Prompt.ask", side_effect=["test_query"]):
+                with patch("convert.hf_search", return_value=[]):
+                    with patch("convert._pause_after"):
+                        _show_guided_hf_download(auto_convert=True)
+
+
+class TestMainWithFile:
+    """Tests for main_with_file function."""
+
+    def test_main_with_file_inspect(self, tmp_path):
+        from convert import main_with_file
+        import argparse
+        gguf = tmp_path / "model.gguf"
+        gguf.write_bytes(b"GGUF" + b"\x00" * 100)
+        args = argparse.Namespace(inspect=True, input=str(gguf), output=None)
+        with patch("convert._has_gguf_py", return_value=False):
+            try:
+                main_with_file(gguf, args)
+            except SystemExit:
+                pass
+
+    def test_main_with_file_preflight_fails(self, tmp_path):
+        from convert import main_with_file
+        import argparse
+        missing = tmp_path / "missing.gguf"
+        args = argparse.Namespace(inspect=False, output=None)
+        with pytest.raises(SystemExit):
+            main_with_file(missing, args)
+
+
+class TestHasCliArgs:
+    """Tests for _has_cli_args with various flag combinations."""
+
+    def test_with_hf_search(self):
+        from convert import _has_cli_args
+        import argparse
+        args = argparse.Namespace(input=None, output=None, scan=False, hf_search="test")
+        assert _has_cli_args(args) is True
+
+    def test_with_scan_omlx(self):
+        from convert import _has_cli_args
+        import argparse
+        args = argparse.Namespace(input=None, output=None, scan=False, scan_omlx=True)
+        assert _has_cli_args(args) is True
+
+    def test_with_output_only(self):
+        from convert import _has_cli_args
+        import argparse
+        args = argparse.Namespace(input=None, output="/out")
+        assert _has_cli_args(args) is True
+
+
+class TestHandleScanMode:
+    """Tests for _handle_scan_mode function."""
+
+    def test_scan_mode_cancelled(self):
+        from convert import _handle_scan_mode, _make_menu_args
+        args = _make_menu_args(scan=True)
+        with patch("convert.scan_for_models", return_value=[]):
+            with patch("convert.display_scan_results", return_value=None):
+                with pytest.raises(SystemExit):
+                    _handle_scan_mode(args)
+
+
+class TestHandleHfSearchMode:
+    """Tests for _handle_hf_search_mode."""
+
+    def test_hf_search_mode_no_results(self):
+        from convert import _handle_hf_search_mode, _make_menu_args
+        args = _make_menu_args(hf_search="nonexistentquery")
+        with patch("convert.get_hf_token", return_value=None):
+            with patch("convert.hf_search", return_value=[]):
+                with pytest.raises(SystemExit):
+                    _handle_hf_search_mode(args)
+
+
+class TestHandleHfListMode:
+    """Tests for _handle_hf_list_mode."""
+
+    def test_hf_list_no_repo(self):
+        from convert import _handle_hf_list_mode, _make_menu_args
+        args = _make_menu_args(hf_list=None)
+        with pytest.raises(SystemExit):
+            _handle_hf_list_mode(args)
+
+    def test_hf_list_no_files(self):
+        from convert import _handle_hf_list_mode, _make_menu_args
+        args = _make_menu_args(hf_list="empty/repo")
+        with patch("convert.get_hf_token", return_value=None):
+            with patch("convert.hf_list_files", return_value=[]):
+                with pytest.raises(SystemExit):
+                    _handle_hf_list_mode(args)
+
+
+class TestPostConvertActions:
+    """Tests for post-convert actions function."""
+
+    def test_post_convert_choose_zero(self, tmp_path):
+        from convert import _show_post_convert_actions, _make_menu_args
+        args = _make_menu_args()
+        gguf = tmp_path / "model.gguf"
+        gguf.write_bytes(b"GGUF" + b"\x00" * 100)
+        out = tmp_path / "output"
+        out.mkdir()
+        (out / "config.json").write_text("{}")
+        with patch("convert.Prompt.ask", side_effect=["0"]):
+            with patch("convert.console.print"):
+                _show_post_convert_actions(args, gguf, out)
+
+    def test_post_convert_list_files(self, tmp_path):
+        from convert import _show_post_convert_actions, _make_menu_args
+        args = _make_menu_args()
+        gguf = tmp_path / "model.gguf"
+        gguf.write_bytes(b"GGUF" + b"\x00" * 100)
+        out = tmp_path / "output"
+        out.mkdir()
+        (out / "model.safetensors").write_bytes(b"\x00" * 1000)
+        with patch("convert.Prompt.ask", side_effect=["3", "0"]):
+            with patch("convert.console.print"):
+                _show_post_convert_actions(args, gguf, out)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Deep Coverage Tests — mock heavy UI paths for 90% coverage
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestDownloadFromHfFullPath:
+    """Full path tests for download_from_huggingface with requests mocking."""
+
+    def test_download_full_success(self, tmp_path):
+        from convert import download_from_huggingface
+        cache = tmp_path / "downloads"
+        cache.mkdir()
+
+        mock_resp = MagicMock()
+        mock_resp.headers = {"content-length": "100"}
+        mock_resp.iter_content = MagicMock(return_value=[b"GGUF", b"data"])
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+
+        with patch("requests.get", return_value=mock_resp):
+            result = download_from_huggingface("org/model", "test.gguf", cache_dir=cache, quiet=True)
+            assert result is not None
+            assert result.exists()
+
+    def test_download_with_auto_convert_gguf(self, tmp_path):
+        from convert import download_from_huggingface
+        cache = tmp_path / "downloads"
+        cache.mkdir()
+        out = tmp_path / "output"
+
+        mock_resp = MagicMock()
+        mock_resp.headers = {"content-length": "100"}
+        mock_resp.iter_content = MagicMock(return_value=[b"GGUF", b"data"])
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+
+        with patch("requests.get", return_value=mock_resp):
+            with patch("convert._auto_convert_downloaded") as mock_ac:
+                result = download_from_huggingface(
+                    "org/model", "model.gguf", cache_dir=cache,
+                    auto_convert=True, output_dir=out, quiet=True,
+                )
+                assert result is not None
+                mock_ac.assert_called_once()
+
+    def test_download_auto_convert_non_gguf(self, tmp_path):
+        from convert import download_from_huggingface
+        cache = tmp_path / "downloads"
+        cache.mkdir()
+
+        mock_resp = MagicMock()
+        mock_resp.headers = {"content-length": "100"}
+        mock_resp.iter_content = MagicMock(return_value=[b"data"])
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+
+        with patch("requests.get", return_value=mock_resp):
+            result = download_from_huggingface(
+                "org/model", "config.json", cache_dir=cache,
+                auto_convert=True, output_dir=tmp_path / "out", quiet=True,
+            )
+            assert result is not None
+
+
+class TestAutoConvertDownloaded:
+    """Tests for _auto_convert_downloaded function."""
+
+    def test_auto_convert_default_args(self, tmp_path):
+        from convert import _auto_convert_downloaded
+        gguf = tmp_path / "model.gguf"
+        gguf.write_bytes(b"GGUF" + b"\x00" * 100)
+        with patch("convert.main_with_file", side_effect=SystemExit(0)):
+            with pytest.raises(SystemExit):
+                _auto_convert_downloaded(gguf, None, False, True, None)
+
+    def test_auto_convert_with_conversion_args(self, tmp_path):
+        from convert import _auto_convert_downloaded, _make_menu_args
+        gguf = tmp_path / "model.gguf"
+        gguf.write_bytes(b"GGUF" + b"\x00" * 100)
+        args = _make_menu_args(bits=8, quiet=True)
+        with patch("convert.main_with_file", side_effect=SystemExit(0)):
+            with pytest.raises(SystemExit):
+                _auto_convert_downloaded(gguf, tmp_path / "out", False, True, args)
+
+    def test_auto_convert_delete_gguf(self, tmp_path):
+        from convert import _auto_convert_downloaded, _make_menu_args
+        gguf = tmp_path / "model.gguf"
+        gguf.write_bytes(b"GGUF" + b"\x00" * 100)
+        args = _make_menu_args(quiet=True)
+        with patch("convert.main_with_file"):
+            _auto_convert_downloaded(gguf, None, True, True, args)
+        assert not gguf.exists()
+
+
+class TestGuidedConvertFullPath:
+    """Full path guided convert tests with more mocking."""
+
+    def test_guided_convert_custom_quant(self, tmp_path):
+        from convert import _show_guided_convert, _make_menu_args
+        gguf = tmp_path / "model.gguf"
+        gguf.write_bytes(b"GGUF" + b"\x00" * 100)
+        args = _make_menu_args(force=True)
+        with patch("convert.get_gguf_path", return_value=gguf):
+            with patch("convert.read_gguf_metadata", return_value={"architecture": "llama"}):
+                with patch("convert.Prompt.ask", side_effect=["3", "4", "64"]):
+                    with patch("convert.Confirm.ask", side_effect=[True, False, False]):
+                        with patch("convert.main_with_file"):
+                            with patch("convert._pause_after"):
+                                _show_guided_convert(args)
+        assert args.bits == 4
+
+    def test_guided_convert_keyboard_interrupt(self, tmp_path):
+        from convert import _show_guided_convert, _make_menu_args
+        gguf = tmp_path / "model.gguf"
+        gguf.write_bytes(b"GGUF" + b"\x00" * 100)
+        args = _make_menu_args(force=True)
+        with patch("convert.get_gguf_path", return_value=gguf):
+            with patch("convert.read_gguf_metadata", return_value={"architecture": "llama"}):
+                with patch("convert.Prompt.ask", side_effect=KeyboardInterrupt):
+                    with patch("convert._pause_after"):
+                        _show_guided_convert(args)
+
+
+class TestGuidedHfDownloadFullPath:
+    """Full path HF download guided tests."""
+
+    def test_guided_hf_single_gguf(self):
+        from convert import _show_guided_hf_download
+        with patch("convert.get_hf_token", return_value=None):
+            with patch("convert.Prompt.ask", side_effect=["test", "1"]):
+                with patch("convert.hf_search", return_value=[{"id": "org/model", "downloads": 1000, "likes": 50}]):
+                    with patch("convert.hf_list_files", return_value=[
+                        {"path": "model.gguf", "size": 5_000_000_000, "size_str": "5.00 GB"}
+                    ]):
+                        with patch("convert.Confirm.ask", return_value=False):
+                            with patch("convert._pause_after"):
+                                _show_guided_hf_download(auto_convert=True)
+
+    def test_guided_hf_keyboard_interrupt(self):
+        from convert import _show_guided_hf_download
+        with patch("convert.get_hf_token", return_value=None):
+            with patch("convert.Prompt.ask", side_effect=KeyboardInterrupt):
+                with patch("convert._pause_after"):
+                    _show_guided_hf_download(auto_convert=False)
+
+
+class TestSettingsMenuFullPath:
+    """Full path settings menu tests."""
+
+    def test_settings_set_token(self, tmp_path):
+        from convert import _show_settings_menu
+        cfg = tmp_path / "config.json"
+        cfg.write_text("{}")
+        hist = tmp_path / "history.json"
+        hist.write_text("[]")
+        with patch("convert.CONFIG_PATH", cfg):
+            with patch("convert.HISTORY_PATH", hist):
+                with patch("convert.CONFIG_DIR", tmp_path):
+                    with patch("convert.Prompt.ask", side_effect=["2", "new_token_123", "5"]):
+                        with patch("convert.console.print"):
+                            _show_settings_menu()
+        import json
+        assert json.loads(cfg.read_text())["hf_token"] == "new_token_123"
+
+    def test_settings_clear_token(self, tmp_path):
+        from convert import _show_settings_menu
+        cfg = tmp_path / "config.json"
+        cfg.write_text('{"hf_token": "old"}')
+        hist = tmp_path / "history.json"
+        hist.write_text("[]")
+        with patch("convert.CONFIG_PATH", cfg):
+            with patch("convert.HISTORY_PATH", hist):
+                with patch("convert.Prompt.ask", side_effect=["3", "5"]):
+                    with patch("convert.Confirm.ask", return_value=True):
+                        with patch("convert.console.print"):
+                            _show_settings_menu()
+        import json
+        data = json.loads(cfg.read_text())
+        assert "hf_token" not in data
+
+    def test_settings_clear_history(self, tmp_path):
+        from convert import _show_settings_menu
+        cfg = tmp_path / "config.json"
+        cfg.write_text("{}")
+        hist = tmp_path / "history.json"
+        hist.write_text('[{"action": "test"}]')
+        with patch("convert.CONFIG_PATH", cfg):
+            with patch("convert.HISTORY_PATH", hist):
+                with patch("convert.Prompt.ask", side_effect=["4", "5"]):
+                    with patch("convert.Confirm.ask", return_value=True):
+                        with patch("convert.console.print"):
+                            _show_settings_menu()
+        assert json.loads(hist.read_text()) == []
+
+
+class TestInteractiveMenuFull:
+    """Full interactive menu loop tests."""
+
+    def test_menu_option_1_convert(self):
+        from convert import run_interactive_menu
+        with patch("convert._menu_banner"):
+            with patch("convert._get_hardware_recommendation", return_value="test"):
+                with patch("convert.Prompt.ask", side_effect=["1", "0"]):
+                    with patch("convert._show_guided_convert", side_effect=lambda *a, **kw: None):
+                        with pytest.raises(SystemExit):
+                            run_interactive_menu()
+
+    def test_menu_option_2_scan(self):
+        from convert import run_interactive_menu
+        with patch("convert._menu_banner"):
+            with patch("convert._get_hardware_recommendation", return_value="test"):
+                with patch("convert.Prompt.ask", side_effect=["2", "0"]):
+                    with patch("convert._show_guided_scan_convert", side_effect=lambda *a, **kw: None):
+                        with pytest.raises(SystemExit):
+                            run_interactive_menu()
+
+    def test_menu_option_3_download(self):
+        from convert import run_interactive_menu
+        with patch("convert._menu_banner"):
+            with patch("convert._get_hardware_recommendation", return_value="test"):
+                with patch("convert.Prompt.ask", side_effect=["3", "0"]):
+                    with patch("convert._show_guided_hf_download", side_effect=lambda *a, **kw: None):
+                        with pytest.raises(SystemExit):
+                            run_interactive_menu()
+
+    def test_menu_option_4_download_convert(self):
+        from convert import run_interactive_menu
+        with patch("convert._menu_banner"):
+            with patch("convert._get_hardware_recommendation", return_value="test"):
+                with patch("convert.Prompt.ask", side_effect=["4", "0"]):
+                    with patch("convert._show_guided_hf_download", side_effect=lambda *a, **kw: None):
+                        with pytest.raises(SystemExit):
+                            run_interactive_menu()
+
+    def test_menu_option_5_inspect(self):
+        from convert import run_interactive_menu
+        with patch("convert._menu_banner"):
+            with patch("convert._get_hardware_recommendation", return_value="test"):
+                with patch("convert.Prompt.ask", side_effect=["5", "0"]):
+                    with patch("convert._show_guided_inspect", side_effect=lambda: None):
+                        with pytest.raises(SystemExit):
+                            run_interactive_menu()
+
+
+class TestHandleHfDownloadFullPath:
+    """Full path tests for _handle_hf_download."""
+
+    def test_hf_download_with_file_specified(self):
+        from convert import _handle_hf_download, _make_menu_args
+        args = _make_menu_args(hf_file="model.gguf", quiet=True)
+        mock_resp = MagicMock()
+        mock_resp.headers = {"content-length": "100"}
+        mock_resp.iter_content = MagicMock(return_value=[b"data"])
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        with patch("convert.get_hf_token", return_value=None):
+            with patch("requests.get", return_value=mock_resp):
+                try:
+                    _handle_hf_download("org/model", args)
+                except SystemExit:
+                    pass
+
+    def test_hf_download_auto_pick_single_gguf(self):
+        from convert import _handle_hf_download, _make_menu_args
+        args = _make_menu_args(hf_file=None, auto_convert=True, quiet=True)
+        with patch("convert.get_hf_token", return_value=None):
+            with patch("convert.hf_list_files", return_value=[
+                {"path": "model.gguf", "size": 5_000_000_000, "size_str": "5.00 GB"}
+            ]):
+                mock_resp = MagicMock()
+                mock_resp.headers = {"content-length": "100"}
+                mock_resp.iter_content = MagicMock(return_value=[b"GGUF", b"data"])
+                mock_resp.raise_for_status = MagicMock()
+                mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+                mock_resp.__exit__ = MagicMock(return_value=False)
+                with patch("requests.get", return_value=mock_resp):
+                    try:
+                        _handle_hf_download("org/model", args)
+                    except SystemExit:
+                        pass
+
+
+class TestHandleScanModeFull:
+    """Full path scan handler tests."""
+
+    def test_scan_gguf_selected_yes(self, tmp_path):
+        from convert import _handle_scan_mode, _make_menu_args, FoundModel
+        args = _make_menu_args(scan=True, force=True)
+        gguf = tmp_path / "model.gguf"
+        gguf.write_bytes(b"GGUF" + b"\x00" * (200 * 1024 * 1024))
+        fm = FoundModel(path=gguf, format="gguf", source="custom", size_gb=0.2, name="model")
+        with patch("convert.scan_for_models", return_value=[fm]):
+            with patch("convert.display_scan_results", return_value=fm):
+                with patch("convert.Confirm.ask", return_value=True):
+                    with patch("convert.main_with_file", side_effect=SystemExit(0)):
+                        with pytest.raises(SystemExit):
+                            _handle_scan_mode(args)
+
+    def test_scan_mlx_selected(self):
+        from convert import _handle_scan_mode, _make_menu_args, FoundModel
+        args = _make_menu_args(scan=True)
+        fm = FoundModel(path=Path("/test/model.safetensors"), format="mlx", source="omlx", size_gb=5.0, name="model")
+        with patch("convert.scan_for_models", return_value=[fm]):
+            with patch("convert.display_scan_results", return_value=fm):
+                with pytest.raises(SystemExit):
+                    _handle_scan_mode(args)
+
+
+class TestHandleHfSearchFull:
+    """Full path HF search handler tests."""
+
+    def test_hf_search_select_and_download(self):
+        from convert import _handle_hf_search_mode, _make_menu_args
+        args = _make_menu_args(hf_search="test", quiet=True)
+        with patch("convert.get_hf_token", return_value=None):
+            with patch("convert.hf_search", return_value=[
+                {"id": "org/model", "downloads": 1000, "likes": 50, "pipeline_tag": "text-generation", "private": False}
+            ]):
+                with patch("convert.Prompt.ask", return_value="1"):
+                    with patch("convert._handle_hf_download", side_effect=SystemExit(0)):
+                        with pytest.raises(SystemExit):
+                            _handle_hf_search_mode(args)
+
+
+class TestHandleHfListFull:
+    """Full path HF list handler tests."""
+
+    def test_hf_list_with_files(self):
+        from convert import _handle_hf_list_mode, _make_menu_args
+        args = _make_menu_args(hf_list="org/model", quiet=True)
+        with patch("convert.get_hf_token", return_value=None):
+            with patch("convert.hf_list_files", return_value=[
+                {"path": "model.gguf", "size": 5_000_000_000, "size_str": "5.00 GB"},
+                {"path": "config.json", "size": 100, "size_str": "100 B"},
+            ]):
+                with pytest.raises(SystemExit):
+                    _handle_hf_list_mode(args)
+
+
+class TestDependencyWizardFull:
+    """Full path dependency wizard tests."""
+
+    def test_dep_wizard_all_installed(self):
+        from convert import _show_dependency_wizard
+        with patch("convert._check_single_dep", return_value=True):
+            with patch("convert._pause_after"):
+                _show_dependency_wizard()
+
+    def test_dep_wizard_install_declined(self):
+        from convert import _show_dependency_wizard
+        with patch("convert._check_single_dep", side_effect=[
+            False, False, True, True, True, True, True, True, True, True
+        ]):
+            with patch("convert.Confirm.ask", return_value=False):
+                with patch("convert._pause_after"):
+                    _show_dependency_wizard()

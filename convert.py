@@ -19,8 +19,7 @@ import subprocess
 import shutil
 import argparse
 from pathlib import Path
-from typing import Any, Optional
-from urllib.parse import urlparse
+from typing import Any
 import json
 from dataclasses import dataclass
 
@@ -38,26 +37,10 @@ from rich.progress import (
 )
 from rich.prompt import Prompt, Confirm
 from rich.rule import Rule
-from rich.text import Text
-from rich.style import Style
 from rich import box
 
 # Hardware detection
 import psutil
-
-# For registry downloads
-try:
-    import urllib.request
-    HAS_URLLIB = True
-except ImportError:
-    HAS_URLLIB = False
-
-# HuggingFace Hub integration
-try:
-    import huggingface_hub as hf_hub
-    HAS_HF_HUB = True
-except ImportError:
-    HAS_HF_HUB = False
 
 # Requests for streaming downloads
 try:
@@ -1161,9 +1144,9 @@ def _scan_directory(
             fmt = "gguf" if path.suffix.lower() == ".gguf" else "mlx"
             try:
                 rel = path.relative_to(directory)
+                name = str(rel.parent / path.stem) if rel.parent != Path(".") else path.stem
             except ValueError:
-                rel = path.name
-            name = str(rel.parent / path.stem) if rel.parent != Path(".") else path.stem
+                name = path.stem
             found.append(FoundModel(
                 path=path, format=fmt, source=source,
                 size_gb=size_gb, name=name,
@@ -1606,8 +1589,6 @@ def _auto_convert_downloaded(
 
     try:
         main_with_file(gguf_path, conv_args)
-    except SystemExit:
-        pass
     except Exception as e:
         fail(f"Auto-convert failed: {e}")
         return
@@ -3361,11 +3342,11 @@ def _handle_hf_download(repo_id: str, args: argparse.Namespace) -> None:
 
 def _handle_hf_list_mode(args: argparse.Namespace) -> None:
     """Handle --hf-list: list files in a HuggingFace repo."""
-    token = args.hf_token or get_hf_token(quiet=args.quiet)
-
     if not args.hf_list:
         fail("--hf-list requires a repo ID")
         sys.exit(1)
+
+    token = args.hf_token or get_hf_token(quiet=args.quiet)
 
     with Progress(
         SpinnerColumn(),
@@ -3400,6 +3381,7 @@ def _handle_hf_list_mode(args: argparse.Namespace) -> None:
     console.print(table)
 
     console.print()
+    sys.exit(0)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Interactive Menu System
@@ -3940,11 +3922,17 @@ def run_interactive_menu() -> None:
 
         console.print(menu)
 
-        choice = Prompt.ask(
-            "  [bold cyan]What would you like to do?[/bold cyan]",
-            choices=["0", "1", "2", "3", "4", "5", "6"],
-            default="1",
-        )
+        try:
+            choice = Prompt.ask(
+                "  [bold cyan]What would you like to do?[/bold cyan]",
+                choices=["0", "1", "2", "3", "4", "5", "6"],
+                default="1",
+            )
+        except (KeyboardInterrupt, EOFError):
+            console.print()
+            info("Goodbye!")
+            console.print()
+            sys.exit(0)
 
         try:
             if choice == "0":
