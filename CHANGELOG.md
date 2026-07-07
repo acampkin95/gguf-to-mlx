@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased] - 2026-07-07
+
+### QC Pass — fix broken suite, latent bugs, and stale imports
+- **Test suite was silently broken** — `test_run_menu_handles_keyboard_interrupt` raised an uncaught `KeyboardInterrupt` that interrupted the whole suite at 277 tests (exit code 2), masking 6 downstream failures + 1 shadowed test class. Root cause: the main-menu `Prompt.ask()` sat outside the `try/except` in `run_interactive_menu()`, so Ctrl+C at the prompt crashed instead of exiting gracefully. Fixed by wrapping the prompt in its own handler that exits cleanly, while preserving "return to menu" for interrupts inside sub-actions.
+- **4 previously-dead tests now execute** — `TestFormatHelpers` was defined twice; the second class shadowed the first, so its 4 edge-case tests never ran. Renamed the first to `TestFormatHelpersEdgeCases`.
+- **Latent `NameError` in `test_settings_clear_history`** — missing `import json`; added module-level import.
+- **3 real code bugs surfaced by the now-complete suite:**
+  - `_auto_convert_downloaded` swallowed `SystemExit` (`except SystemExit: pass`), masking the no-disk-space cancel path so a cancelled conversion printed "complete" and deleted the GGUF. Removed the swallow; `SystemExit` now propagates.
+  - `_handle_hf_list_mode` did not exit after listing files (`--hf-list` fell through in `main()`); added `sys.exit(0)` to match `_handle_hf_search_mode` and terminate correctly.
+  - `_handle_hf_list_mode` prompted for an HF token *before* validating that `--hf-list` was provided; reordered validation-first.
+- **Test isolation** — `test_download_no_requests_exits` hit the real `~/.cache` instead of an isolated `tmp_path`; fixed. Added missing `get_hf_token` mocks to the HF search/list-empty tests.
+- **Lint/type cleanup** — removed 6 stale imports from `convert.py` (`Optional`, `urlparse`, `Text`, `Style`, and the dead `urllib.request`/`huggingface_hub` availability blocks whose `HAS_*` flags were never read) and 14 ruff errors from `test_convert.py`. `convert.py` mypy is now clean; 3 remaining errors are in vendored `gguf2mlx/core.py` (out of scope).
+- **Verification** — `ruff check` clean, `mypy convert.py` clean (excl. vendored), `pytest` 326 passed / exit 0, `convert.py --help` OK.
+
+### Planning: macOS GUI Application
+- **Master plan drafted** — `plans/MACOS_GUI_MASTERPLAN.md` (16 sections + review notes) covers architecture, framework decision, screen-by-screen design, packaging, milestones, risks, and acceptance criteria for shipping a native macOS `.app` wrapper around `convert.py` + `gguf2mlx/`.
+- **Framework selection** — PyObjC + AppKit (primary), rumps menu-bar companion as a separate `.app` + LaunchAgent, with SwiftUI shell / Tauri documented as future fallbacks.
+- **Functional-parity mandate** — every CLI flag from `build_parser()` (30 distinct flags) mapped to a GUI control; existing 326 test methods (111 classes) at 91.97 % coverage are preserved and grown.
+- **Critical review pass** — 9 issues found and fixed: corrected Step-2 subprocess misconception, surfaced `py2app` build as net-new (no existing `setup.py`/`Makefile` GUI targets), clarified `LSUIElement` semantics for main app vs rumps companion, refreshed stale test counts, added `hf:` URL syntax + `ARCH_MAP` references, and pruned invented post-convert options. Full audit in §17 of the master plan.
+- **No code changes** — this entry is planning-only; implementation deferred to v1.5.0 per the milestone schedule in the master plan.
+
 ## [1.4.0] - 2026-07-06
 
 ### Vendor gguf2mlx Internally

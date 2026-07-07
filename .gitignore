@@ -85,6 +85,8 @@ temp/
 # AI-only work directories (Claude Code)
 .aistore/
 .omc/
+# Pi subagent scratch artifacts
+.pi-subagents/
 # SonarQube
 .scannerwork/
 
